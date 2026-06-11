@@ -37,10 +37,14 @@ services:
       SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
       # 의존 서비스도 DNS로 (order는 해당 주소로 product를 동기 호출)
       PRODUCT_SERVICE_URL: http://product-service:8080
+      # Kafka 브로커도 DNS로
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "${ORDER_SERVICE_PORT}:8080"
     depends_on:
       order-db:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
       # product-service는 depends_on에 넣지 않는다 (일부러 의도)
     healthcheck:
@@ -80,10 +84,13 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://product-db:3306/${PRODUCT_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
       SPRING_DATASOURCE_USERNAME: ${PRODUCT_DB_USER}
       SPRING_DATASOURCE_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "${PRODUCT_SERVICE_PORT}:8080"
     depends_on:
       product-db:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
@@ -91,6 +98,37 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    networks:
+      - commerce-net
+
+  # 3단계: 이벤트 브로커. 단일 브로커 KRaft 모드(주키퍼 없음).
+  # 리스너 2개:
+  #   - PLAINTEXT(kafka:9092): compose 네트워크 안의 서비스들이 쓰는 주소
+  #   - EXTERNAL(localhost:9094): 맥(호스트)에서 IDE로 직접 띄울 때 쓰는 주소
+  kafka:
+    image: apache/kafka:3.9.0
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # 단일 브로커라 복제 인자는 전부 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
     networks:
       - commerce-net
 
