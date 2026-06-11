@@ -40,6 +40,9 @@ dependencies {
 	// Swagger
 	implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.9'
 
+	// Kafka
+	implementation 'org.springframework.kafka:spring-kafka'
+
 	// Prometheus registry
 	runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
 

@@ -9,6 +9,7 @@ import com.commerce.order.fixture.OrderRequestFixture;
 import com.commerce.order.fixture.StockDeductApiResponseFixture;
 import com.commerce.order.global.client.ProductClient;
 import com.commerce.order.global.exception.ApplicationException;
+import com.commerce.order.messaging.OrderEventPublisher;
 import com.commerce.order.repository.OrderRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -45,6 +46,9 @@ class OrderServiceTest {
     @Mock
     private ProductClient productClient;
 
+    @Mock
+    private OrderEventPublisher orderEventPublisher;
+
     @Nested
     @DisplayName("createOrder")
     class CreateOrder {
@@ -64,6 +68,7 @@ class OrderServiceTest {
                     .extracting(OrderItemResponse::getProductName).containsExactly("키보드", "컴퓨터");
             then(productClient).should().deductStock(any());
             then(orderRepository).should().save(any(Order.class));
+            then(orderEventPublisher).should().publishOrderCreated(any());   // 주문 생성 이벤트 발행
         }
 
         @Test

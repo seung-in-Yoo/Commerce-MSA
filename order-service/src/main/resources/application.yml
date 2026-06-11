@@ -16,6 +16,15 @@ spring:
         format_sql: true
     open-in-view: false
 
+  # Kafka 발행자(producer) -> 값은 JSON으로 직렬화
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+
 server:
   port: ${SERVER_PORT:8080}
 
