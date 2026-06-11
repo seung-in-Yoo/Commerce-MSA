@@ -1,0 +1,18 @@
+# 환경변수
+.env
+
+# Gradle
+.gradle/
+**/build/
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+
+# Logs
+*.log
