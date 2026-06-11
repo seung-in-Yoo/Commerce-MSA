@@ -43,39 +43,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 이 **순서대로** 간다. 각 단계는 직전 단계의 고통을 해소한다.
 
-1. **서비스 1개 + DB 1개** (워밍업) — Spring Boot를 compose로 띄우기. 
-2. **서비스 2개 + DB 2개, REST 동기 호출** — "남의 DB JOIN 못 함", "쟤 죽으면 나도 죽음" 체감. ← **다음 (§16)**
-3. 그 동기 호출 하나를 **Kafka 이벤트로 전환**.
+1. ✅ **서비스 1개 + DB 1개** (워밍업) — Spring Boot를 compose로 띄우기.
+2. ✅ **서비스 2개 + DB 2개, REST 동기 호출** — order가 주문 생성 시 product를 동기 호출(재고차감+상품정보). "남의 DB JOIN 못 함", "쟤 죽으면 나도 죽음" 체감. ← **현재 위치**
+3. **[다음]** 그 동기 호출 하나를 **Kafka 이벤트로 전환**.
 4. **Saga**(choreography vs orchestration), **Outbox**, eventual consistency.
 5. **API Gateway**, 분산 추적, **Circuit Breaker**(Resilience4j).
 
 > **현재 위치를 항상 의식한다.** 로드맵상 아직 안 온 인프라(Kafka, 게이트웨이, Saga, 보안/JWT, 마이그레이션 툴 등)는 해당 단계에 도달하기 전엔 추가하지 않는다.
 
-### 1단계 결과물 
+### 현재 구조 (2단계까지)
 
 ```
 commerce-msa/
-├── docker-compose.yml          # order-db(mysql:8.0) + order-service
+├── docker-compose.yml          # order-db + order-service + product-db + product-service
 ├── .env.example / .gitignore / README.md / CLAUDE.md
-└── order-service/
-    ├── Dockerfile              # 멀티스테이지: gradlew 빌드(JDK) → JRE 실행, curl 포함
-    ├── build.gradle            # web/jpa/validation/actuator/mysql/lombok
-    └── src/main/
-        ├── resources/application.yml   # DB env 외부화, health liveness/readiness(+db) 그룹
-        └── java/com/commerce/order/
-            ├── OrderApplication
-            ├── domain/         # Order(애그리거트 루트) / OrderItem / OrderStatus
-            ├── repository/     # OrderRepository
-            ├── service/        # OrderService (create / get)
-            ├── controller/     # OrderController (POST·GET /api/v1/orders, Swagger)
-            ├── dto/            # 요청=record(CreateOrderRequest/OrderLineRequest) / 응답=@Builder(OrderResponse/OrderItemResponse)
-            ├── exception/      # OrderErrorCase (enum, ErrorCase 구현)
-            └── global/         # response/CommonResponse, exception/{ApplicationException, ErrorCase, GlobalExceptionHandler}
+├── order-service/   (포트 8080, order-db:3306)
+│   └── src/main/java/com/commerce/order/
+│       ├── domain/ Order(애그리거트 루트)/OrderItem/OrderStatus
+│       ├── repository/ service/ controller/(/api/v1/orders) dto/ exception/(OrderErrorCase)
+│       └── global/
+│           ├── response/CommonResponse  exception/{ApplicationException,ErrorCase,GlobalExceptionHandler}
+│           ├── config/RestClientConfig          # product 호출용 RestClient(타임아웃·DNS baseURL)
+│           └── client/ProductClient + dto/       # product-service 동기 호출 래퍼
+└── product-service/ (포트 8081, product-db:3307)
+    └── src/main/java/com/commerce/product/
+        ├── domain/Product(재고 보유)
+        ├── repository/(decreaseStock 원자적 UPDATE) service/ controller/(/api/v1/products) dto/ exception/(ProductErrorCase)
+        └── global/   
 ```
 
-**1단계에 심어둔 학습 장치** :
-- 설정 env 외부화 / DB를 **DNS(`order-db`)**로 접속 / **liveness·readiness 분리** / `depends_on: service_healthy`.
-- **`OrderItem`은 `productId`만 보유(FK 아님)** → 2단계 "남의 DB는 JOIN 못 하고 ID+API로만 접근"의 복선.
+**심어둔 학습 장치**:
+- env 외부화 / DB·서비스 모두 **DNS로 접속**(`order-db`, `product-service`) / **liveness·readiness 분리** / `depends_on: service_healthy`.
+- **DB per service**: order는 product의 테이블을 모른다. 상품 이름/가격/재고는 product에 **API로 물어본다**(`ProductClient`).
+- **order는 product의 health를 기다리지 않는다**(compose `depends_on`에서 제외) → 런타임에 product를 죽여 "요청 시점 실패 전파"를 관찰.
+- **RestClient 타임아웃**(connect 1s / read 2s) → product가 죽거나 느리면 무한 대기 대신 `ORDER_004`(503)로 빠르게 실패.
+- **분산 트랜잭션 구멍을 일부러 남김**: `OrderService.createOrder` 주석 — 재고 차감(원격) 성공 후 주문 저장(로컬) 실패 시 불일치. 3·4단계(Kafka/Outbox/Saga)에서 해소.
 
 ---
 
