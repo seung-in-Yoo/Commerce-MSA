@@ -1,0 +1,55 @@
+# 1단계: 서비스 1개(order-service) + DB 1개(order-db)
+
+# 핵심 포인트
+# order-service는 order-db라는 DNS로 DB에 붙는다. localhost/고정 IP 아님.
+# order-db가 'healthy'가 된 뒤 order-service가 뜸
+
+services:
+  order-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${ORDER_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${ORDER_DB_NAME}
+      MYSQL_USER: ${ORDER_DB_USER}
+      MYSQL_PASSWORD: ${ORDER_DB_PASSWORD}
+    ports:
+      - "${ORDER_DB_PORT}:3306"
+    volumes:
+      - order-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${ORDER_DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - commerce-net
+
+  order-service:
+    build:
+      context: ./order-service
+    environment:
+      SERVER_PORT: 8080
+      # DB 호스트는 고정 IP가 아니라 compose 서비스 이름 (order-db)
+      SPRING_DATASOURCE_URL: jdbc:mysql://order-db:3306/${ORDER_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      SPRING_DATASOURCE_USERNAME: ${ORDER_DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
+    ports:
+      - "${ORDER_SERVICE_PORT}:8080"
+    depends_on:
+      order-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - commerce-net
+
+volumes:
+  order-db-data:
+
+networks:
+  commerce-net:
+    driver: bridge
