@@ -17,6 +17,19 @@ spring:
         format_sql: true
     open-in-view: false
 
+  # Kafka 구독자(consumer) -> order-events 토픽을 JSON으로 역직렬화
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    consumer:
+      group-id: product-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.commerce.product.messaging.event.OrderCreatedEvent
+        spring.json.trusted.packages: "*"
+
 server:
   port: ${SERVER_PORT:8080}
 
