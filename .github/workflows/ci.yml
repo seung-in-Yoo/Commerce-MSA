@@ -1,0 +1,38 @@
+name: CI pipeline (MSA)
+
+on:
+  push:
+    branches: ["develop", "main"]
+  pull_request:
+    branches: ["develop", "main"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.service }})
+    runs-on: ubuntu-latest
+
+    # 각 서비스는 독립 Gradle 빌드 → matrix로 병렬 검증
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ["order-service", "product-service"]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "gradle"
+
+      - name: Build & test (${{ matrix.service }})
+        working-directory: ${{ matrix.service }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean build --stacktrace
