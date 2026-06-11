@@ -40,7 +40,10 @@ dependencies {
 	// Swagger
 	implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.9'
 
-	// Prometheus registry (나중에 모니터링용, 지금은 actuator와 함께 둠)
+	// Kafka
+	implementation 'org.springframework.kafka:spring-kafka'
+
+	// Prometheus registry
 	runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
 
 	// MySQL
