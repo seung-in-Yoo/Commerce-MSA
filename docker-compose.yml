@@ -1,8 +1,10 @@
-# 1단계: 서비스 1개(order-service) + DB 1개(order-db)
-
+# 2단계: 서비스 2개(order, product) + DB 2개(order-db, product-db)
+#
 # 핵심 포인트
-# order-service는 order-db라는 DNS로 DB에 붙는다. localhost/고정 IP 아님.
-# order-db가 'healthy'가 된 뒤 order-service가 뜸
+# - 각 서비스는 자기 DB만 소유 (DB per service). order는 product의 테이블을 모름
+# - order-service는 product-service를 'product-service'라는 DNS로 호출 (PRODUCT_SERVICE_URL)
+# - order-service는 product-service의 health를 '기다리지 않는다' (depends_on에 product 없음)
+# - product가 죽어도 order는 떠 있고, '주문 요청을 받는 순간' 실패가 전파되는 걸 관찰해보기
 
 services:
   order-db:
@@ -33,10 +35,55 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://order-db:3306/${ORDER_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
       SPRING_DATASOURCE_USERNAME: ${ORDER_DB_USER}
       SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
+      # 의존 서비스도 DNS로 (order는 해당 주소로 product를 동기 호출)
+      PRODUCT_SERVICE_URL: http://product-service:8080
     ports:
       - "${ORDER_SERVICE_PORT}:8080"
     depends_on:
       order-db:
+        condition: service_healthy
+      # product-service는 depends_on에 넣지 않는다 (일부러 의도)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - commerce-net
+
+  product-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PRODUCT_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${PRODUCT_DB_NAME}
+      MYSQL_USER: ${PRODUCT_DB_USER}
+      MYSQL_PASSWORD: ${PRODUCT_DB_PASSWORD}
+    ports:
+      - "${PRODUCT_DB_PORT}:3306"
+    volumes:
+      - product-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${PRODUCT_DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - commerce-net
+
+  product-service:
+    build:
+      context: ./product-service
+    environment:
+      SERVER_PORT: 8080
+      # product도 자기 DB(product-db)에 DNS로 붙음
+      SPRING_DATASOURCE_URL: jdbc:mysql://product-db:3306/${PRODUCT_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      SPRING_DATASOURCE_USERNAME: ${PRODUCT_DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${PRODUCT_DB_PASSWORD}
+    ports:
+      - "${PRODUCT_SERVICE_PORT}:8080"
+    depends_on:
+      product-db:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
@@ -49,6 +96,7 @@ services:
 
 volumes:
   order-db-data:
+  product-db-data:
 
 networks:
   commerce-net:
