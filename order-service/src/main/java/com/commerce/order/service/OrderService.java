@@ -8,6 +8,8 @@ import com.commerce.order.global.client.ProductClient;
 import com.commerce.order.global.client.dto.StockDeductApiRequest;
 import com.commerce.order.global.client.dto.StockDeductApiResponse;
 import com.commerce.order.global.exception.ApplicationException;
+import com.commerce.order.messaging.OrderEventPublisher;
+import com.commerce.order.messaging.event.OrderCreatedEvent;
 import com.commerce.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -22,6 +24,7 @@ public class OrderService {
 
     private final OrderRepository orderRepository;
     private final ProductClient productClient;
+    private final OrderEventPublisher orderEventPublisher;
 
     @Transactional
     public OrderResponse createOrder(CreateOrderRequest request) {
@@ -44,6 +47,16 @@ public class OrderService {
         // order의 로컬 DB 트랜잭션은 위의 HTTP 호출을 롤백하지 못함 (분산 트랜잭션 문제)
         // HTTP 호출이 해당 트랜잭션 경계 안에 있어 네트워크 시간만큼 DB 커넥션을 잡음
         Order saved = orderRepository.save(order);
+
+        // 주문 생성 사실을 이벤트로도 발행 (기존 동기 흐름은 그대로 둔 채 추가만)
+        OrderCreatedEvent event = new OrderCreatedEvent(
+                saved.getId(),
+                saved.getCustomerId(),
+                saved.getItems().stream()
+                        .map(item -> new OrderCreatedEvent.Item(item.getProductId(), item.getQuantity()))
+                        .toList());
+        orderEventPublisher.publishOrderCreated(event);
+
         return OrderResponse.from(saved);
     }
 
