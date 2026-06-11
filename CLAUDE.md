@@ -67,9 +67,10 @@ commerce-msa/
             ├── domain/         # Order(애그리거트 루트) / OrderItem / OrderStatus
             ├── repository/     # OrderRepository
             ├── service/        # OrderService (create / get)
-            ├── controller/     # OrderController (POST·GET /api/orders)
-            ├── dto/            # CreateOrderRequest / OrderLineRequest / OrderResponse / OrderItemResponse (record)
-            └── global/exception/   # GlobalExceptionHandler / OrderNotFoundException / ErrorResponse
+            ├── controller/     # OrderController (POST·GET /api/v1/orders, Swagger)
+            ├── dto/            # 요청=record(CreateOrderRequest/OrderLineRequest) / 응답=@Builder(OrderResponse/OrderItemResponse)
+            ├── exception/      # OrderErrorCase (enum, ErrorCase 구현)
+            └── global/         # response/CommonResponse, exception/{ApplicationException, ErrorCase, GlobalExceptionHandler}
 ```
 
 **1단계에 심어둔 학습 장치** :
@@ -115,9 +116,10 @@ cd order-service
 ```bash
 curl http://localhost:8080/actuator/health/liveness     
 curl http://localhost:8080/actuator/health/readiness    
-curl -X POST http://localhost:8080/api/orders -H 'Content-Type: application/json' \
+curl -X POST http://localhost:8080/api/v1/orders -H 'Content-Type: application/json' \
   -d '{"customerId":1,"items":[{"productId":100,"productName":"키보드","unitPrice":30000,"quantity":2}]}'
-curl http://localhost:8080/api/orders/1
+curl http://localhost:8080/api/v1/orders/1     
+# Swagger UI: http://localhost:8080/swagger-ui.html
 ```
 
 **직접 관찰할 것**: `docker compose stop order-db` → readiness가 DOWN으로 바뀌는지 확인 
@@ -190,57 +192,87 @@ public class OrderService {
 ```
 
 - 생성자 주입은 **`@RequiredArgsConstructor`**. `@Autowired` 필드 주입 금지.
-- 클래스 레벨 `@Transactional(readOnly = true)` + **쓰기 메서드만 `@Transactional` 오버라이드.** (현재 OrderService는 메서드별 `@Transactional`을 쓰는데, 메서드가 늘어나면 위 클래스-레벨 패턴으로 정리.)
+- 클래스 레벨 `@Transactional(readOnly = true)` + **쓰기 메서드만 `@Transactional` 오버라이드.** (현재 `OrderService`가 이 패턴.)
+- **비즈니스 예외는 `ApplicationException.from(XxxErrorCase.YYY)`로 던진다**(§11). 예: `findById(...).orElseThrow(() -> ApplicationException.from(OrderErrorCase.ORDER_NOT_FOUND))`.
 - **2단계 이후 — 외부 서비스 동기 호출 주의**: 트랜잭션 경계 안에서 다른 서비스를 동기 호출하면 그 호출이 트랜잭션을 길게 잡는다. "왜 이게 문제인지"를 체감하는 게 2단계 목표이므로, **처음엔 일부러 단순하게 호출해 고통을 관찰**하고, 그 다음에 타임아웃/실패 전파/경계 분리를 다룬다.
 
 ---
 
-## 9. Controller 룰
+## 9. Controller 룰 
 
 ```java
 @RestController
-@RequestMapping("/api/orders")
+@RequestMapping("/api/v1/orders")
+@Validated
 @RequiredArgsConstructor
 public class OrderController {
 
     private final OrderService orderService;
 
     @PostMapping
-    public ResponseEntity<OrderResponse> createOrder(
-            @Valid @RequestBody CreateOrderRequest request, UriComponentsBuilder uriBuilder) {
-        OrderResponse response = orderService.createOrder(request);
-        URI location = uriBuilder.path("/api/orders/{id}").buildAndExpand(response.orderId()).toUri();
-        return ResponseEntity.created(location).body(response);   // 201 + Location
+    @Operation(summary = "주문 생성", description = "고객 ID와 주문 항목 목록으로 새 주문을 생성한다.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "주문 생성 성공",
+                    content = @Content(schema = @Schema(implementation = CommonResponse.class))),
+            @ApiResponse(responseCode = "400", description = "잘못된 요청 (필수 값 누락/유효성 위반)",
+                    content = @Content(schema = @Schema(implementation = CommonResponse.class)))
+    })
+    public CommonResponse<OrderResponse> createOrder(@RequestBody @Valid CreateOrderRequest request) {
+        return CommonResponse.success(orderService.createOrder(request));
+    }
+
+    @GetMapping("/{orderId}")
+    @Operation(summary = "주문 단건 조회", description = "주문 ID로 주문 상세를 조회한다.")
+    @ApiResponses({ /* 200 / 404 ... */ })
+    public CommonResponse<OrderResponse> getOrder(
+            @Parameter(description = "조회할 주문 ID", example = "1", required = true)
+            @Positive @PathVariable Long orderId) {
+        return CommonResponse.success(orderService.getOrder(orderId));
     }
 }
 ```
 
-- **URL prefix**: `/api/{resource}` (예: `/api/orders`). 서비스마다 자기 리소스 prefix.
-- 생성은 `201 Created` + `Location` 헤더, 조회는 `200 OK`, 삭제는 `204 No Content`.
-- `@Valid @RequestBody`로 Bean Validation 적극 사용. 검증 실패는 `GlobalExceptionHandler`가 400으로 변환(§11).
+- **모든 응답은 `CommonResponse<T>` 봉투로 감싼다.** 컨트롤러는 `ResponseEntity`가 아니라 `CommonResponse.success(...)`를 반환(성공은 HTTP 200). 에러 상태/바디는 `GlobalExceptionHandler`가 `ErrorCase`로부터 만든다(§11).
+- **URL prefix**: `/api/v1/{resource}` (예: `/api/v1/orders`). 버전(`v1`) 포함, 서비스마다 자기 리소스 prefix.
+- **모든 메서드에 Swagger `@Operation` + `@ApiResponses` 부착**(특히 4xx). `@Schema(implementation = CommonResponse.class)`. Swagger UI: `http://localhost:8080/swagger-ui.html`.
+- `@Validated`(클래스) + `@Valid @RequestBody` + `@Positive @PathVariable`로 Bean Validation 적극 사용. 본문 검증 실패 → 400(`MethodArgumentNotValidException`), 파라미터 제약 위반 → 400(`ConstraintViolationException`) 모두 핸들러가 잡는다.
 
 ---
 
-## 10. DTO 룰 (record 표준)
+## 10. DTO 룰 (요청=record / 응답=@Builder 클래스)
 
-현재 코드는 **Java `record`**를 쓴다(`CreateOrderRequest`, `OrderLineRequest`, `OrderResponse`, `OrderItemResponse`). 이걸 표준으로 유지한다.
-
-- **요청 record**: 컴포넌트에 Bean Validation 부착(`@NotNull`, `@Positive`, `@Size`, `@Valid`(중첩) 등). 메시지는 한글 OK.
-- **응답 record**: 정적 팩토리 `from(Entity)` / `of(...)`로 엔티티 → DTO 변환. 엔티티를 컨트롤러로 그대로 노출하지 않는다.
-- 명명: `{Resource}{Action}Request` / `{Resource}{Action}Response`. 한 줄(라인) 단위 요청은 `{Resource}LineRequest`처럼.
-
-> record를 쓰므로 FestiMap의 `@Getter @Builder` + `ReflectionTestUtils` 방식은 **여기선 안 쓴다.** 테스트 fixture도 record 생성자를 그대로 호출한다(§14.4).
+- **요청 DTO = Java `record`** (`CreateOrderRequest`, `OrderLineRequest`). 컴포넌트에 Bean Validation 부착(`@NotNull`, `@NotEmpty`, `@Positive`, `@Valid`(중첩) 등). 접근은 `request.customerId()`.
+- **응답 DTO = `@Getter @Builder` 클래스** (`OrderResponse`, `OrderItemResponse`). **정적 팩토리 `from(Entity)`**로 엔티티 → DTO 변환. 엔티티를 컨트롤러로 그대로 노출하지 않는다. 접근은 `response.getOrderId()`.
+  ```java
+  @Getter @Builder
+  public class OrderResponse {
+      private final Long orderId;
+      // ...
+      public static OrderResponse from(Order order) { return OrderResponse.builder()...build(); }
+  }
+  ```
+- 명명: `{Resource}{Action}Request` / `{Resource}{Action}Response`. 한 줄(라인) 단위 요청은 `{Resource}LineRequest`.
+- **테스트 fixture**: 요청 record는 생성자 그대로, 응답 클래스는 빌더로 만든다(§14.4). record라 `ReflectionTestUtils`는 불필요.
 
 ---
 
-## 11. ErrorCode / Exception 룰
+## 11. ErrorCase / Exception 룰 
 
-현재는 도메인 예외 + `@RestControllerAdvice` 글로벌 핸들러 + 공통 `ErrorResponse` 구조.
+**개별 예외 클래스를 만들지 않는다.** 단일 `ApplicationException` + 도메인별 `ErrorCase` enum 구조.
 
-- **도메인 예외 클래스**: 의미 있는 이름의 전용 예외(`OrderNotFoundException` 패턴). `global/exception/`에 둔다.
-- **`GlobalExceptionHandler`(`@RestControllerAdvice`)가 예외 → HTTP 상태 + `ErrorResponse` 변환을 일괄 담당.** 현재 매핑: `OrderNotFoundException` → 404, `MethodArgumentNotValidException`(검증 실패) → 400.
-- 새 도메인 예외를 추가하면 핸들러에 매핑 1줄 추가. **상태 코드는 의미에 맞게**(없으면 충돌/중복 → 409, 잘못된 요청 → 400, 못 찾음 → 404).
-- 서비스가 늘어나 ErrorCode가 많아지면 그때 **`ErrorCode` enum + `BaseException`** 구조(FestiMap 스타일)로 승격을 검토 — 지금은 과하다(YAGNI).
+- **`global/exception/ErrorCase`**(인터페이스): `getHttpStatus()` / `getCode()` / `getMessage()`.
+- **`global/exception/ApplicationException`**: `ErrorCase`를 들고 있는 단일 예외. **`ApplicationException.from(errorCase)`** 정적 팩토리로만 생성·던진다.
+- **`{domain}/exception/{Domain}ErrorCase`**(enum, `ErrorCase` 구현): 도메인마다 자기 enum. 코드 형식 `{DOMAIN}_{3자리}`.
+  ```java
+  @Getter @RequiredArgsConstructor
+  public enum OrderErrorCase implements ErrorCase {
+      ORDER_NOT_FOUND(HttpStatus.NOT_FOUND, "ORDER_001", "존재하지 않는 주문입니다.");
+      private final HttpStatus httpStatus; private final String code; private final String message;
+  }
+  ```
+- **던지기**: `throw ApplicationException.from(OrderErrorCase.ORDER_NOT_FOUND);` (서비스에서 `orElseThrow(() -> ApplicationException.from(...))`).
+- **`global/exception/GlobalExceptionHandler`(`@RestControllerAdvice`)**가 일괄 변환 → 바디는 항상 `CommonResponse.error(code, message)`(§9 봉투와 통일). 현재 매핑: `ApplicationException` → ErrorCase의 상태, `MethodArgumentNotValidException`/`ConstraintViolationException` → 400.
+- 새 에러는 **해당 도메인 `ErrorCase` enum에 한 줄 추가**가 전부(핸들러 수정 불필요). 상태 코드는 의미에 맞게(중복/충돌 409, 잘못된 요청 400, 못 찾음 404).
 
 ---
 
@@ -294,16 +326,17 @@ class OrderServiceTest {
 
             OrderResponse response = orderService.createOrder(request);
 
-            assertThat(response.totalAmount()).isEqualTo(75000L);
+            assertThat(response.getTotalAmount()).isEqualTo(75000L);   // 응답=클래스 → getter
             then(orderRepository).should().save(any(Order.class));
         }
 
         @Test
-        @DisplayName("실패 - 존재하지 않는 orderId → OrderNotFoundException")
+        @DisplayName("실패 - 존재하지 않는 orderId → ApplicationException(ORDER_NOT_FOUND)")
         void notFound() {
             given(orderRepository.findById(99L)).willReturn(Optional.empty());
             assertThatThrownBy(() -> orderService.getOrder(99L))
-                    .isInstanceOf(OrderNotFoundException.class);
+                    .isInstanceOf(ApplicationException.class)
+                    .extracting("errorCase").isEqualTo(OrderErrorCase.ORDER_NOT_FOUND);
         }
     }
 }
@@ -319,8 +352,8 @@ class OrderServiceTest {
 
 - **AssertJ만** 사용. JUnit `assertEquals`/`assertTrue` 금지.
   ```java
-  assertThat(response.items()).hasSize(2).extracting(OrderItemResponse::productName).contains("키보드");
-  assertThatThrownBy(() -> service.getOrder(99L)).isInstanceOf(OrderNotFoundException.class);
+  assertThat(response.getItems()).hasSize(2).extracting(OrderItemResponse::getProductName).contains("키보드");
+  assertThatThrownBy(() -> service.getOrder(99L)).isInstanceOf(ApplicationException.class);
   assertThatCode(() -> service.createOrder(valid)).doesNotThrowAnyException();
   ```
 - **BDDMockito만** 사용. `when(...).thenReturn(...)` 금지 → `given(...).willReturn(...)`. void는 `willDoNothing().given(...)`.
@@ -335,10 +368,10 @@ class OrderControllerTest {
 
     @Autowired private MockMvc mockMvc;
     @MockitoBean private OrderService orderService;    // @MockBean(deprecated) 금지
-    private static final String BASE = "/api/orders";
+    private static final String BASE = "/api/v1/orders";
 
     @Test
-    @DisplayName("성공 - 주문 생성 시 201 Created + Location, body 반환")
+    @DisplayName("성공 - 주문 생성 → 200, CommonResponse.data 반환")
     void create_success() throws Exception {
         given(orderService.createOrder(any())).willReturn(OrderResponseFixture.defaultResponse());
 
@@ -346,16 +379,19 @@ class OrderControllerTest {
                 {"customerId":1,"items":[{"productId":100,"productName":"키보드","unitPrice":30000,"quantity":2}]}
                 """))
             .andDo(print())                            // 실패 시 디버깅용 — 모든 테스트에 부착
-            .andExpect(status().isCreated())
-            .andExpect(header().exists("Location"))
-            .andExpect(jsonPath("$.orderId").value(1L));
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.success").value(true))      
+            .andExpect(jsonPath("$.data.orderId").value(1L));  // 실제 데이터는 data 아래
     }
 
     @Test
-    @DisplayName("실패 - 존재하지 않는 주문 조회 → 404")
+    @DisplayName("실패 - 존재하지 않는 주문 조회 → 404, code=ORDER_001")
     void get_notFound() throws Exception {
-        given(orderService.getOrder(99L)).willThrow(new OrderNotFoundException(99L));
-        mockMvc.perform(get(BASE + "/{id}", 99L)).andExpect(status().isNotFound());
+        given(orderService.getOrder(99L)).willThrow(ApplicationException.from(OrderErrorCase.ORDER_NOT_FOUND));
+        mockMvc.perform(get(BASE + "/{id}", 99L))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.success").value(false))
+            .andExpect(jsonPath("$.code").value("ORDER_001"));
     }
 }
 ```
@@ -363,25 +399,34 @@ class OrderControllerTest {
 **필수 룰**
 - **`@WebMvcTest(controllers = XxxController.class)`** — 슬라이스 명시. 전체 컨트롤러 로드 금지.
 - **`@MockitoBean`**(Spring Boot 3.4+). `@MockBean`은 deprecated.
-- JSON body는 **Java Text Block**(`"""`)으로. `.andDo(print())` 부착. `jsonPath`로 응답 검증.
-- HTTP 상태는 핸들러 매핑과 **정확히 일치**시켜 검증(404/400/201/204 등). `GlobalExceptionHandler`도 슬라이스에 로드되므로 예외 → 상태 매핑을 그대로 검증 가능.
+- JSON body는 **Java Text Block**(`"""`)으로. `.andDo(print())` 부착. 응답은 **`CommonResponse` 봉투**라 `$.success` / `$.code` / `$.data.*`로 검증.
+- HTTP 상태는 `ErrorCase`/핸들러 매핑과 **정확히 일치**시켜 검증(404/400 등). `GlobalExceptionHandler`도 슬라이스에 로드되므로 예외 → 상태·code 매핑을 그대로 검증 가능.
 - **보안/JWT가 없으므로** `@WithMockUser`/`TestSecurityConfig`는 지금 불필요. (게이트웨이·인증이 들어오는 단계에서 추가한다.)
 
-### 14.4 Fixture 클래스 (record라 단순)
+### 14.4 Fixture 클래스
 
-DTO가 record라 fixture는 **정적 팩토리 + 기본값**이면 충분하다. 위치: `src/test/java/com/commerce/order/fixture/`.
+위치: `src/test/java/com/commerce/order/fixture/`. **요청(record)은 생성자 그대로, 응답(@Builder 클래스)은 빌더로** 기본값을 만든다.
 
 ```java
-public class OrderRequestFixture {
-
+public class OrderRequestFixture {                     // 요청 record fixture
     public static CreateOrderRequest defaultCreateRequest() {
         return new CreateOrderRequest(1L, List.of(
                 new OrderLineRequest(100L, "키보드", 30000L, 2),
                 new OrderLineRequest(200L, "마우스", 15000L, 1)));
     }
-
     public static CreateOrderRequest createRequest(Long customerId, List<OrderLineRequest> items) {
         return new CreateOrderRequest(customerId, items);
+    }
+}
+
+public class OrderResponseFixture {                    // 응답 @Builder fixture (컨트롤러 슬라이스 stub용)
+    public static OrderResponse defaultResponse() {
+        return OrderResponse.builder()
+                .orderId(1L).customerId(1L).status(OrderStatus.CREATED).totalAmount(75000L)
+                .items(List.of(OrderItemResponse.builder()
+                        .productId(100L).productName("키보드").unitPrice(30000L).quantity(2).lineTotal(60000L).build()))
+                .createdAt(LocalDateTime.of(2026, 1, 1, 0, 0))
+                .build();
     }
 }
 ```

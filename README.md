@@ -40,8 +40,8 @@ curl http://localhost:8080/actuator/health/liveness
 # readiness: 요청 받을 준비 됐나 (DB까지 OK여야 UP)
 curl http://localhost:8080/actuator/health/readiness
 
-# 주문 생성
-curl -i -X POST http://localhost:8080/api/orders \
+# 주문 생성 
+curl -i -X POST http://localhost:8080/api/v1/orders \
   -H 'Content-Type: application/json' \
   -d '{
     "customerId": 1,
@@ -51,8 +51,11 @@ curl -i -X POST http://localhost:8080/api/orders \
     ]
   }'
 
-# 주문 조회 (위에서 받은 orderId로)
-curl http://localhost:8080/api/orders/1
+# 주문 조회 
+curl http://localhost:8080/api/v1/orders/1
+
+# API 문서 / 브라우저로 직접 테스트: Swagger UI
+#   http://localhost:8080/swagger-ui.html
 ```
 
 ### 직접 관찰해볼 것
