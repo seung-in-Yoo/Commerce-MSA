@@ -31,7 +31,9 @@ public class OrderItem {
     @Column(nullable = false)
     private Long productId;
 
-    @Column(nullable = false)
+    // 주문 생성 시점엔 product 소유 데이터(이름/가격)를 모름 → null/0으로 둠
+    // 동기 호출을 없애고 비동기 이벤트로 전환
+    @Column
     private String productName;
 
     @Column(nullable = false)
@@ -40,16 +42,16 @@ public class OrderItem {
     @Column(nullable = false)
     private int quantity;
 
-    private OrderItem(Order order, Long productId, String productName, long unitPrice, int quantity) {
+    private OrderItem(Order order, Long productId, int quantity) {
         this.order = order;
         this.productId = productId;
-        this.productName = productName;
-        this.unitPrice = unitPrice;
+        this.productName = null;
+        this.unitPrice = 0L;
         this.quantity = quantity;
     }
 
-    static OrderItem of(Order order, Long productId, String productName, long unitPrice, int quantity) {
-        return new OrderItem(order, productId, productName, unitPrice, quantity);
+    static OrderItem of(Order order, Long productId, int quantity) {
+        return new OrderItem(order, productId, quantity);
     }
 
     public long getLineTotal() {

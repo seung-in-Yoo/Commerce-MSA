@@ -55,8 +55,8 @@ public class Order {
         return new Order(customerId);
     }
 
-    public void addItem(Long productId, String productName, long unitPrice, int quantity) {
-        OrderItem item = OrderItem.of(this, productId, productName, unitPrice, quantity);
+    public void addItem(Long productId, int quantity) {
+        OrderItem item = OrderItem.of(this, productId, quantity);
         this.items.add(item);
         this.totalAmount += item.getLineTotal();
     }
