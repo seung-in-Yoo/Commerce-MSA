@@ -33,6 +33,15 @@ public class PaymentService {
         return PaymentResponse.from(paymentRepository.save(payment));
     }
 
+    // 재고 실패 수신 시 해당 주문의 결제를 환불
+    @Transactional
+    public PaymentResponse refund(Long orderId) {
+        Payment payment = paymentRepository.findByOrderId(orderId)
+                .orElseThrow(() -> ApplicationException.from(PaymentErrorCase.PAYMENT_NOT_FOUND));
+        payment.refund();
+        return PaymentResponse.from(payment);
+    }
+
     public PaymentResponse getPayment(Long paymentId) {
         return PaymentResponse.from(findPayment(paymentId));
     }

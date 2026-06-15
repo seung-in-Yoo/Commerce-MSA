@@ -29,13 +29,14 @@ public class OrderService {
         // 주문은 자기가 아는 것(productId, quantity)만으로 먼저 생성하고,
         // 재고 차감은 OrderCreated 이벤트로 product-service에 비동기로 위임
         Order order = Order.create(request.customerId());
-        request.items().forEach(line -> order.addItem(line.productId(), line.quantity()));
+        request.items().forEach(line -> order.addItem(line.productId(), line.quantity(), line.unitPrice()));
         Order saved = orderRepository.save(order);
 
-        // 재고 차감을 이벤트로 위임 -> product가 해당 토픽을 구독해 비동기로 재고를 깎음
+        // payment가 먼저 구독해 결제를 시도하고(amount), 그 다음 product가 재고를 깎음
         OrderCreatedEvent event = new OrderCreatedEvent(
                 saved.getId(),
                 saved.getCustomerId(),
+                saved.getTotalAmount(),
                 saved.getItems().stream()
                         .map(item -> new OrderCreatedEvent.Item(item.getProductId(), item.getQuantity()))
                         .toList());
