@@ -1,6 +1,7 @@
 package com.commerce.order.service;
 
 import com.commerce.order.domain.Order;
+import com.commerce.order.domain.ProductSnapshot;
 import com.commerce.order.dto.CreateOrderRequest;
 import com.commerce.order.dto.OrderResponse;
 import com.commerce.order.exception.OrderErrorCase;
@@ -11,6 +12,8 @@ import com.commerce.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -42,8 +45,25 @@ public class OrderService {
     }
 
     public OrderResponse getOrder(Long orderId) {
-        Order order = orderRepository.findById(orderId)
+        return OrderResponse.from(findOrder(orderId));
+    }
+
+    // 재고 차감 성공(StockProcessed DEDUCTED) 수신 시 주문에 상품 스냅샷을 채우고 확정
+    @Transactional
+    public void confirmOrder(Long orderId, List<ProductSnapshot> snapshots) {
+        Order order = findOrder(orderId);
+        order.confirm(snapshots);
+    }
+
+    // 재고 차감 실패(StockProcessed FAILED) 수신 시 주문을 취소
+    @Transactional
+    public void cancelOrder(Long orderId) {
+        Order order = findOrder(orderId);
+        order.cancel();
+    }
+
+    private Order findOrder(Long orderId) {
+        return orderRepository.findById(orderId)
                 .orElseThrow(() -> ApplicationException.from(OrderErrorCase.ORDER_NOT_FOUND));
-        return OrderResponse.from(order);
     }
 }
