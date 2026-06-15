@@ -51,7 +51,7 @@ class OrderServiceTest {
     class CreateOrder {
 
         @Test
-        @DisplayName("성공 - 요청(productId+quantity)만으로 주문 생성, 이름 null·total 0, 이벤트 발행")
+        @DisplayName("성공 - 예상 단가로 total 산정·PENDING 저장, 이름은 null, 이벤트 발행")
         void success() {
             given(orderRepository.save(any(Order.class))).willAnswer(inv -> inv.getArgument(0));
 
@@ -61,11 +61,10 @@ class OrderServiceTest {
             assertThat(response.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(response.getItems()).hasSize(2)
                     .extracting(OrderItemResponse::getProductId).containsExactly(1L, 3L);
-            // step3b: 이름/가격은 product 소유라 아직 모름 → null, total 0
+            assertThat(response.getTotalAmount()).isEqualTo(660000L);
             assertThat(response.getItems()).extracting(OrderItemResponse::getProductName).containsOnlyNulls();
-            assertThat(response.getTotalAmount()).isZero();
             then(orderRepository).should().save(any(Order.class));
-            then(orderEventPublisher).should().publishOrderCreated(any());   // 재고 차감을 위임하는 이벤트 발행
+            then(orderEventPublisher).should().publishOrderCreated(any());   // Saga 시작 이벤트 발행
         }
 
         @Test
@@ -120,7 +119,7 @@ class OrderServiceTest {
         @DisplayName("성공 - 주문을 찾아 스냅샷 적용 후 CONFIRMED, total 재계산")
         void success() {
             Order order = Order.create(1L);
-            order.addItem(100L, 2);
+            order.addItem(100L, 2, 25000L);   // 예상 단가 25000 → 확정 시 실제 단가 30000으로 덮어쓰여 재계산
             given(orderRepository.findById(1L)).willReturn(Optional.of(order));
 
             orderService.confirmOrder(1L, List.of(new ProductSnapshot(100L, "키보드", 30000L)));
@@ -149,7 +148,7 @@ class OrderServiceTest {
         @DisplayName("성공 - 주문을 찾아 CANCELLED로 전이")
         void success() {
             Order order = Order.create(1L);
-            order.addItem(100L, 2);
+            order.addItem(100L, 2, 30000L);
             given(orderRepository.findById(1L)).willReturn(Optional.of(order));
 
             orderService.cancelOrder(1L);
