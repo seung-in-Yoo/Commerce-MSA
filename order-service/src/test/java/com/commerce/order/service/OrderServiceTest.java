@@ -57,7 +57,7 @@ class OrderServiceTest {
             OrderResponse response = orderService.createOrder(OrderRequestFixture.defaultCreateRequest());
 
             assertThat(response.getCustomerId()).isEqualTo(1L);
-            assertThat(response.getStatus()).isEqualTo(OrderStatus.CREATED);
+            assertThat(response.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(response.getItems()).hasSize(2)
                     .extracting(OrderItemResponse::getProductId).containsExactly(1L, 3L);
             // step3b: 이름/가격은 product 소유라 아직 모름 → null, total 0
@@ -88,7 +88,7 @@ class OrderServiceTest {
             Order order = mock(Order.class);
             given(order.getId()).willReturn(1L);
             given(order.getCustomerId()).willReturn(1L);
-            given(order.getStatus()).willReturn(OrderStatus.CREATED);
+            given(order.getStatus()).willReturn(OrderStatus.PENDING);
             given(order.getTotalAmount()).willReturn(60000L);
             given(order.getItems()).willReturn(List.of());
             given(orderRepository.findById(1L)).willReturn(Optional.of(order));
