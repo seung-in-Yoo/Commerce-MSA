@@ -129,10 +129,16 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://payment-db:3306/${PAYMENT_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
       SPRING_DATASOURCE_USERNAME: ${PAYMENT_DB_USER}
       SPRING_DATASOURCE_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      # 결제는 OrderCreated 구독 + PaymentProcessed 발행 + 재고실패 환불 -> 브로커도 DNS로
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 결제 승인 한도
+      PAYMENT_APPROVAL_LIMIT: ${PAYMENT_APPROVAL_LIMIT:-1000000}
     ports:
       - "${PAYMENT_SERVICE_PORT}:8080"
     depends_on:
       payment-db:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
