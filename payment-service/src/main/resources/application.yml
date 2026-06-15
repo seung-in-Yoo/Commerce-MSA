@@ -16,6 +16,24 @@ spring:
         format_sql: true
     open-in-view: false
 
+  # Kafka: order-events(OrderCreated) + product-events(StockProcessed) 구독 + payment-events 발행
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: payment-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.commerce.payment.messaging.event.OrderCreatedEvent
+        spring.json.trusted.packages: "*"
+
 # 결제 승인 규칙: 금액이 한도를 넘으면 승인 거절(FAILED)
 payment:
   approval-limit: ${PAYMENT_APPROVAL_LIMIT:1000000}
