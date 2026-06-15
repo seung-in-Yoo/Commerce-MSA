@@ -16,7 +16,7 @@ spring:
         format_sql: true
     open-in-view: false
 
-  # Kafka 발행자(producer) -> 값은 JSON으로 직렬화
+  # Kafka: order-events 발행(producer) + product-events 구독(consumer)
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
     producer:
@@ -24,6 +24,16 @@ spring:
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       properties:
         spring.json.add.type.headers: false
+    # 재고 처리 결과(StockProcessed)를 product-events에서 구독
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.commerce.order.messaging.event.StockProcessedEvent
+        spring.json.trusted.packages: "*"
 
 server:
   port: ${SERVER_PORT:8080}

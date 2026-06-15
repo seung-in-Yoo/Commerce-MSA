@@ -17,9 +17,15 @@ spring:
         format_sql: true
     open-in-view: false
 
-  # Kafka 구독자(consumer) -> order-events 토픽을 JSON으로 역직렬화
+  # Kafka: order-events 구독(consumer) + product-events 발행(producer)
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    # 결과 이벤트를 product-events로 발행
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
     consumer:
       group-id: product-service
       auto-offset-reset: earliest

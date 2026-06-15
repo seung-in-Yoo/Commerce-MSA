@@ -54,6 +54,12 @@ public class OrderItem {
         return new OrderItem(order, productId, quantity);
     }
 
+    // product가 재고 차감 후 알려준 이름/단가를 주문 시점 스냅샷으로 채움
+    void applyProductInfo(String productName, long unitPrice) {
+        this.productName = productName;
+        this.unitPrice = unitPrice;
+    }
+
     public long getLineTotal() {
         return unitPrice * quantity;
     }

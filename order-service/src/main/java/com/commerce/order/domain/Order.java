@@ -46,7 +46,7 @@ public class Order {
 
     private Order(Long customerId) {
         this.customerId = customerId;
-        this.status = OrderStatus.CREATED;
+        this.status = OrderStatus.PENDING;   // 재고 차감 결과를 기다리는 Saga 시작 상태
         this.totalAmount = 0L;
         this.createdAt = LocalDateTime.now();
     }
@@ -58,6 +58,25 @@ public class Order {
     public void addItem(Long productId, int quantity) {
         OrderItem item = OrderItem.of(this, productId, quantity);
         this.items.add(item);
-        this.totalAmount += item.getLineTotal();
+        this.totalAmount += item.getLineTotal();   // 생성 시점엔 단가 0이라 0 누적
+    }
+
+    // 재고 차감 성공 수신 시 product가 준 이름/단가를 각 항목에 채우고 총액을 다시 계산한 뒤 주문을 확정
+    public void confirm(List<ProductSnapshot> snapshots) {
+        snapshots.forEach(snapshot -> items.stream()
+                .filter(item -> item.getProductId().equals(snapshot.productId()))
+                .forEach(item -> item.applyProductInfo(snapshot.productName(), snapshot.unitPrice())));
+        recalculateTotal();
+        this.status = OrderStatus.CONFIRMED;
+    }
+
+    // 재고 차감 실패 수신 시 주문을 취소
+    // PENDING 주문을 무효화하는 보상 트랜잭션의 order 결과
+    public void cancel() {
+        this.status = OrderStatus.CANCELLED;
+    }
+
+    private void recalculateTotal() {
+        this.totalAmount = items.stream().mapToLong(OrderItem::getLineTotal).sum();
     }
 }

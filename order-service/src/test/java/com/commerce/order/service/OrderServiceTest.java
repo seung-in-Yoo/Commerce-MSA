@@ -2,6 +2,7 @@ package com.commerce.order.service;
 
 import com.commerce.order.domain.Order;
 import com.commerce.order.domain.OrderStatus;
+import com.commerce.order.domain.ProductSnapshot;
 import com.commerce.order.dto.OrderItemResponse;
 import com.commerce.order.dto.OrderResponse;
 import com.commerce.order.exception.OrderErrorCase;
@@ -57,7 +58,7 @@ class OrderServiceTest {
             OrderResponse response = orderService.createOrder(OrderRequestFixture.defaultCreateRequest());
 
             assertThat(response.getCustomerId()).isEqualTo(1L);
-            assertThat(response.getStatus()).isEqualTo(OrderStatus.CREATED);
+            assertThat(response.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(response.getItems()).hasSize(2)
                     .extracting(OrderItemResponse::getProductId).containsExactly(1L, 3L);
             // step3b: 이름/가격은 product 소유라 아직 모름 → null, total 0
@@ -88,7 +89,7 @@ class OrderServiceTest {
             Order order = mock(Order.class);
             given(order.getId()).willReturn(1L);
             given(order.getCustomerId()).willReturn(1L);
-            given(order.getStatus()).willReturn(OrderStatus.CREATED);
+            given(order.getStatus()).willReturn(OrderStatus.PENDING);
             given(order.getTotalAmount()).willReturn(60000L);
             given(order.getItems()).willReturn(List.of());
             given(orderRepository.findById(1L)).willReturn(Optional.of(order));
@@ -108,6 +109,52 @@ class OrderServiceTest {
                     .isInstanceOf(ApplicationException.class)
                     .extracting(e -> ((ApplicationException) e).getErrorCase())
                     .isEqualTo(OrderErrorCase.ORDER_NOT_FOUND);
+        }
+    }
+
+    @Nested
+    @DisplayName("confirmOrder")
+    class ConfirmOrder {
+
+        @Test
+        @DisplayName("성공 - 주문을 찾아 스냅샷 적용 후 CONFIRMED, total 재계산")
+        void success() {
+            Order order = Order.create(1L);
+            order.addItem(100L, 2);
+            given(orderRepository.findById(1L)).willReturn(Optional.of(order));
+
+            orderService.confirmOrder(1L, List.of(new ProductSnapshot(100L, "키보드", 30000L)));
+
+            assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
+            assertThat(order.getTotalAmount()).isEqualTo(60000L);
+        }
+
+        @Test
+        @DisplayName("실패 - 존재하지 않는 주문 → ORDER_NOT_FOUND")
+        void notFound() {
+            given(orderRepository.findById(99L)).willReturn(Optional.empty());
+
+            assertThatThrownBy(() -> orderService.confirmOrder(99L, List.of()))
+                    .isInstanceOf(ApplicationException.class)
+                    .extracting(e -> ((ApplicationException) e).getErrorCase())
+                    .isEqualTo(OrderErrorCase.ORDER_NOT_FOUND);
+        }
+    }
+
+    @Nested
+    @DisplayName("cancelOrder")
+    class CancelOrder {
+
+        @Test
+        @DisplayName("성공 - 주문을 찾아 CANCELLED로 전이")
+        void success() {
+            Order order = Order.create(1L);
+            order.addItem(100L, 2);
+            given(orderRepository.findById(1L)).willReturn(Optional.of(order));
+
+            orderService.cancelOrder(1L);
+
+            assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
         }
     }
 }
