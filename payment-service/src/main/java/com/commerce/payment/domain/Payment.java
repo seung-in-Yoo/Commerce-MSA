@@ -52,4 +52,12 @@ public class Payment {
     public static Payment failed(Long orderId, long amount) {
         return new Payment(orderId, amount, PaymentStatus.FAILED);
     }
+
+    // 재고 실패로 인한 결제 환불
+    public void refund() {
+        if (this.status == PaymentStatus.APPROVED) {
+            this.status = PaymentStatus.REFUNDED;
+        }
+        // 이미 REFUNDED거나 FAILED면 무시
+    }
 }
