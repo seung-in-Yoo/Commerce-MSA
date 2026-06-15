@@ -3,6 +3,8 @@ package com.commerce.payment.service;
 import com.commerce.payment.domain.Payment;
 import com.commerce.payment.domain.PaymentStatus;
 import com.commerce.payment.dto.PaymentResponse;
+import com.commerce.payment.exception.PaymentErrorCase;
+import com.commerce.payment.global.exception.ApplicationException;
 import com.commerce.payment.repository.PaymentRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -14,7 +16,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
@@ -60,6 +65,45 @@ class PaymentServiceTest {
             assertThat(response.getStatus()).isEqualTo(PaymentStatus.FAILED);
             assertThat(response.getOrderId()).isEqualTo(2L);
             then(paymentRepository).should().save(any(Payment.class));
+        }
+    }
+
+    @Nested
+    @DisplayName("refund")
+    class Refund {
+
+        @Test
+        @DisplayName("성공 - 승인된 결제를 찾아 REFUNDED로 전이")
+        void approved_becomesRefunded() {
+            Payment approved = Payment.approved(1L, 660000L);
+            given(paymentRepository.findByOrderId(1L)).willReturn(Optional.of(approved));
+
+            PaymentResponse response = paymentService.refund(1L);
+
+            assertThat(response.getStatus()).isEqualTo(PaymentStatus.REFUNDED);
+        }
+
+        @Test
+        @DisplayName("성공 - 이미 환불된 결제를 다시 환불해도 REFUNDED 유지(멱등)")
+        void alreadyRefunded_staysRefunded() {
+            Payment approved = Payment.approved(1L, 660000L);
+            approved.refund();   // 이미 한 번 환불
+            given(paymentRepository.findByOrderId(1L)).willReturn(Optional.of(approved));
+
+            PaymentResponse response = paymentService.refund(1L);
+
+            assertThat(response.getStatus()).isEqualTo(PaymentStatus.REFUNDED);
+        }
+
+        @Test
+        @DisplayName("실패 - 결제가 없으면 PAYMENT_NOT_FOUND")
+        void notFound() {
+            given(paymentRepository.findByOrderId(99L)).willReturn(Optional.empty());
+
+            assertThatThrownBy(() -> paymentService.refund(99L))
+                    .isInstanceOf(ApplicationException.class)
+                    .extracting(e -> ((ApplicationException) e).getErrorCase())
+                    .isEqualTo(PaymentErrorCase.PAYMENT_NOT_FOUND);
         }
     }
 }
