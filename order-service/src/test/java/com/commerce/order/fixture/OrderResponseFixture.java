@@ -13,7 +13,7 @@ public class OrderResponseFixture {
         return OrderResponse.builder()
                 .orderId(1L)
                 .customerId(1L)
-                .status(OrderStatus.CREATED)
+                .status(OrderStatus.CONFIRMED)
                 .totalAmount(660000L)
                 .items(List.of(
                         OrderItemResponse.builder()
