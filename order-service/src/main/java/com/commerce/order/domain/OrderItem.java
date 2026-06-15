@@ -31,8 +31,7 @@ public class OrderItem {
     @Column(nullable = false)
     private Long productId;
 
-    // 주문 생성 시점엔 product 소유 데이터(이름/가격)를 모름 → null/0으로 둠
-    // 동기 호출을 없애고 비동기 이벤트로 전환
+    // 이름은 product 소유라 주문 생성 시점엔 모름 → null로 두고, 재고 차감 후 product가 채움
     @Column
     private String productName;
 
@@ -42,16 +41,16 @@ public class OrderItem {
     @Column(nullable = false)
     private int quantity;
 
-    private OrderItem(Order order, Long productId, int quantity) {
+    private OrderItem(Order order, Long productId, int quantity, long unitPrice) {
         this.order = order;
         this.productId = productId;
         this.productName = null;
-        this.unitPrice = 0L;
+        this.unitPrice = unitPrice;
         this.quantity = quantity;
     }
 
-    static OrderItem of(Order order, Long productId, int quantity) {
-        return new OrderItem(order, productId, quantity);
+    static OrderItem of(Order order, Long productId, int quantity, long unitPrice) {
+        return new OrderItem(order, productId, quantity, unitPrice);
     }
 
     // product가 재고 차감 후 알려준 이름/단가를 주문 시점 스냅샷으로 채움
