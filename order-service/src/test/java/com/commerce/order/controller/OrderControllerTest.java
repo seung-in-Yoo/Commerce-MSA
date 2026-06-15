@@ -38,7 +38,7 @@ class OrderControllerTest {
         given(orderService.createOrder(any())).willReturn(OrderResponseFixture.defaultResponse());
 
         mockMvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content("""
-                        {"customerId":1,"items":[{"productId":1,"quantity":2},{"productId":3,"quantity":1}]}
+                        {"customerId":1,"items":[{"productId":1,"quantity":2,"unitPrice":30000},{"productId":3,"quantity":1,"unitPrice":600000}]}
                         """))
                 .andDo(print())
                 .andExpect(status().isOk())
@@ -64,7 +64,7 @@ class OrderControllerTest {
                 .willThrow(ApplicationException.from(OrderErrorCase.PRODUCT_SERVICE_UNAVAILABLE));
 
         mockMvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content("""
-                        {"customerId":1,"items":[{"productId":1,"quantity":1}]}
+                        {"customerId":1,"items":[{"productId":1,"quantity":1,"unitPrice":30000}]}
                         """))
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.code").value("ORDER_004"));
@@ -77,7 +77,7 @@ class OrderControllerTest {
                 .willThrow(ApplicationException.from(OrderErrorCase.PRODUCT_OUT_OF_STOCK));
 
         mockMvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content("""
-                        {"customerId":1,"items":[{"productId":1,"quantity":9999}]}
+                        {"customerId":1,"items":[{"productId":1,"quantity":9999,"unitPrice":30000}]}
                         """))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ORDER_003"));

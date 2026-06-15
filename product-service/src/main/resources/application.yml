@@ -17,7 +17,8 @@ spring:
         format_sql: true
     open-in-view: false
 
-  # Kafka: order-events 구독(consumer) + product-events 발행(producer)
+  # Kafka: payment-events 구독(consumer) + product-events 발행(producer)
+  # 재고 차감 트리거를 OrderCreated -> PaymentProcessed(APPROVED)로 변경
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
     # 결과 이벤트를 product-events로 발행
@@ -33,7 +34,7 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
         spring.json.use.type.headers: false
-        spring.json.value.default.type: com.commerce.product.messaging.event.OrderCreatedEvent
+        spring.json.value.default.type: com.commerce.product.messaging.event.PaymentProcessedEvent
         spring.json.trusted.packages: "*"
 
 server:

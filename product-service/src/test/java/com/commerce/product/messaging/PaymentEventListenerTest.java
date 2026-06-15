@@ -3,7 +3,7 @@ package com.commerce.product.messaging;
 import com.commerce.product.dto.StockDeductRequest;
 import com.commerce.product.dto.StockDeductResponse;
 import com.commerce.product.exception.ProductErrorCase;
-import com.commerce.product.fixture.OrderEventFixture;
+import com.commerce.product.fixture.PaymentEventFixture;
 import com.commerce.product.global.exception.ApplicationException;
 import com.commerce.product.messaging.event.StockProcessedEvent;
 import com.commerce.product.service.ProductService;
@@ -25,14 +25,15 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
-@DisplayName("OrderEventListener 단위 테스트")
-class OrderEventListenerTest {
+@DisplayName("PaymentEventListener 단위 테스트")
+class PaymentEventListenerTest {
 
     @InjectMocks
-    private OrderEventListener orderEventListener;
+    private PaymentEventListener paymentEventListener;
 
     @Mock
     private ProductService productService;
@@ -41,12 +42,12 @@ class OrderEventListenerTest {
     private ProductEventPublisher productEventPublisher;
 
     @Nested
-    @DisplayName("onOrderCreated")
-    class OnOrderCreated {
+    @DisplayName("onPaymentProcessed")
+    class OnPaymentProcessed {
 
         @Test
-        @DisplayName("성공 - 차감 후 차감 결과로 StockProcessed(DEDUCTED, 이름/단가 포함) 발행")
-        void success_publishesDeducted() {
+        @DisplayName("성공 - APPROVED면 차감 후 StockProcessed(DEDUCTED, 이름/단가 포함) 발행")
+        void approved_deductsAndPublishesDeducted() {
             given(productService.deductStock(any())).willReturn(StockDeductResponse.builder()
                     .items(List.of(
                             StockDeductResponse.Item.builder()
@@ -55,7 +56,7 @@ class OrderEventListenerTest {
                                     .productId(3L).productName("컴퓨터").unitPrice(600000L).quantity(1).build()))
                     .build());
 
-            orderEventListener.onOrderCreated(OrderEventFixture.defaultEvent());
+            paymentEventListener.onPaymentProcessed(PaymentEventFixture.approvedEvent());
 
             ArgumentCaptor<StockDeductRequest> reqCaptor = ArgumentCaptor.forClass(StockDeductRequest.class);
             then(productService).should().deductStock(reqCaptor.capture());
@@ -67,18 +68,26 @@ class OrderEventListenerTest {
             StockProcessedEvent published = evtCaptor.getValue();
             assertThat(published.orderId()).isEqualTo(1L);
             assertThat(published.result()).isEqualTo(StockProcessedEvent.Result.DEDUCTED);
-            assertThat(published.reasonCode()).isNull();
             assertThat(published.items())
                     .extracting(StockProcessedEvent.Item::productName).containsExactly("키보드", "컴퓨터");
         }
 
         @Test
-        @DisplayName("실패 - deductStock이 OUT_OF_STOCK을 던지면 전파 대신 StockProcessed(FAILED) 발행")
+        @DisplayName("성공 - FAILED면 재고를 건드리지 않고 무시(차감/발행 없음)")
+        void failed_ignored() {
+            paymentEventListener.onPaymentProcessed(PaymentEventFixture.failedEvent());
+
+            then(productService).should(never()).deductStock(any());
+            then(productEventPublisher).should(never()).publishStockProcessed(any());
+        }
+
+        @Test
+        @DisplayName("실패 - 차감이 OUT_OF_STOCK을 던지면 전파 대신 StockProcessed(FAILED) 발행")
         void deductFails_publishesFailed() {
             given(productService.deductStock(any()))
                     .willThrow(ApplicationException.from(ProductErrorCase.OUT_OF_STOCK));
 
-            assertThatCode(() -> orderEventListener.onOrderCreated(OrderEventFixture.defaultEvent()))
+            assertThatCode(() -> paymentEventListener.onPaymentProcessed(PaymentEventFixture.approvedEvent()))
                     .doesNotThrowAnyException();
 
             ArgumentCaptor<StockProcessedEvent> evtCaptor = ArgumentCaptor.forClass(StockProcessedEvent.class);

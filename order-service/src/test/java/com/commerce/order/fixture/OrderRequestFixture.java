@@ -9,8 +9,8 @@ public class OrderRequestFixture {
 
     public static CreateOrderRequest defaultCreateRequest() {
         return new CreateOrderRequest(1L, List.of(
-                new OrderLineRequest(1L, 2),
-                new OrderLineRequest(3L, 1)));
+                new OrderLineRequest(1L, 2, 30000L),
+                new OrderLineRequest(3L, 1, 600000L)));
     }
 
     public static CreateOrderRequest createRequest(Long customerId, List<OrderLineRequest> items) {

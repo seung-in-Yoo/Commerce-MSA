@@ -55,10 +55,10 @@ public class Order {
         return new Order(customerId);
     }
 
-    public void addItem(Long productId, int quantity) {
-        OrderItem item = OrderItem.of(this, productId, quantity);
+    public void addItem(Long productId, int quantity, long unitPrice) {
+        OrderItem item = OrderItem.of(this, productId, quantity, unitPrice);
         this.items.add(item);
-        this.totalAmount += item.getLineTotal();   // 생성 시점엔 단가 0이라 0 누적
+        this.totalAmount += item.getLineTotal();
     }
 
     // 재고 차감 성공 수신 시 product가 준 이름/단가를 각 항목에 채우고 총액을 다시 계산한 뒤 주문을 확정

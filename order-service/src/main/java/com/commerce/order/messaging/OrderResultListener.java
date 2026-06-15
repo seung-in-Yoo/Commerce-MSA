@@ -19,7 +19,7 @@ public class OrderResultListener {
 
     private final OrderService orderService;
 
-    @KafkaListener(topics = "product-events")
+    @KafkaListener(topics = "product-events", containerFactory = "stockProcessedListenerFactory")
     public void onStockProcessed(StockProcessedEvent event) {
         log.info("[order] StockProcessed 수신 <- orderId={}, result={}", event.orderId(), event.result());
 

@@ -3,7 +3,7 @@ package com.commerce.product.messaging;
 import com.commerce.product.dto.StockDeductRequest;
 import com.commerce.product.dto.StockDeductResponse;
 import com.commerce.product.global.exception.ApplicationException;
-import com.commerce.product.messaging.event.OrderCreatedEvent;
+import com.commerce.product.messaging.event.PaymentProcessedEvent;
 import com.commerce.product.messaging.event.StockProcessedEvent;
 import com.commerce.product.service.ProductService;
 import lombok.RequiredArgsConstructor;
@@ -13,19 +13,26 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 
-// order-events 토픽 구독자
-// OrderCreated를 받아 재고를 차감하고, 그 처리 결과(성공/실패)를 StockProcessed 이벤트로 되돌려보냄
+// payment-events 토픽 구독자
+// 결제 승인을 받아 재고를 차감하고, 그 결과를 StockProcessed로 되돌려보냄
+// 결제 거절은 같은 토픽으로 오지만 재고를 건드리지 않고 무시
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class OrderEventListener {
+public class PaymentEventListener {
 
     private final ProductService productService;
     private final ProductEventPublisher productEventPublisher;
 
-    @KafkaListener(topics = "order-events")
-    public void onOrderCreated(OrderCreatedEvent event) {
-        log.info("[product] OrderCreated 수신 <- orderId={}, items={}", event.orderId(), event.items());
+    @KafkaListener(topics = "payment-events")
+    public void onPaymentProcessed(PaymentProcessedEvent event) {
+        if (event.result() != PaymentProcessedEvent.Result.APPROVED) {
+            // 결제가 거절된 주문은 재고 차감 단계로 진행하지 않음
+            log.info("[product] PaymentProcessed(FAILED) 무시 - 재고 단계 진행 안 함 -> orderId={}", event.orderId());
+            return;
+        }
+
+        log.info("[product] PaymentProcessed(APPROVED) 수신 <- orderId={}, items={}", event.orderId(), event.items());
 
         StockDeductRequest request = new StockDeductRequest(
                 event.items().stream()
@@ -39,7 +46,8 @@ public class OrderEventListener {
                     StockProcessedEvent.deducted(event.orderId(), toEventItems(response)));
             log.info("[product] 재고 차감 완료 -> orderId={}", event.orderId());
         } catch (ApplicationException e) {
-            // 차감 실패(재고 부족/상품 없음) -> 삼키지 않고 FAILED 발행 -> order가 CANCELLED로 보상
+            // 차감 실패(재고 부족/상품 없음) -> 삼키지 않고 FAILED 발행
+            // -> order는 주문 취소, payment는 환불
             log.warn("[product] 재고 차감 실패 -> orderId={}, code={} -> StockProcessed(FAILED) 발행",
                     event.orderId(), e.getErrorCase().getCode());
             productEventPublisher.publishStockProcessed(

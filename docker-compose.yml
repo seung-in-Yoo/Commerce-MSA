@@ -101,6 +101,54 @@ services:
     networks:
       - commerce-net
 
+  # payment-service + payment-db -> 결제는 saga 이벤트로 구동
+  payment-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PAYMENT_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${PAYMENT_DB_NAME}
+      MYSQL_USER: ${PAYMENT_DB_USER}
+      MYSQL_PASSWORD: ${PAYMENT_DB_PASSWORD}
+    ports:
+      - "${PAYMENT_DB_PORT}:3306"
+    volumes:
+      - payment-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${PAYMENT_DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - commerce-net
+
+  payment-service:
+    build:
+      context: ./payment-service
+    environment:
+      SERVER_PORT: 8080
+      SPRING_DATASOURCE_URL: jdbc:mysql://payment-db:3306/${PAYMENT_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      SPRING_DATASOURCE_USERNAME: ${PAYMENT_DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      # 결제는 OrderCreated 구독 + PaymentProcessed 발행 + 재고실패 환불 -> 브로커도 DNS로
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 결제 승인 한도
+      PAYMENT_APPROVAL_LIMIT: ${PAYMENT_APPROVAL_LIMIT:-1000000}
+    ports:
+      - "${PAYMENT_SERVICE_PORT}:8080"
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - commerce-net
+
   # 3단계: 이벤트 브로커. 단일 브로커 KRaft 모드(주키퍼 없음).
   # 리스너 2개:
   #   - PLAINTEXT(kafka:9092): compose 네트워크 안의 서비스들이 쓰는 주소
@@ -135,6 +183,7 @@ services:
 volumes:
   order-db-data:
   product-db-data:
+  payment-db-data:
 
 networks:
   commerce-net:
