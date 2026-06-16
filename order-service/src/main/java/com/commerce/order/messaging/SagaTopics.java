@@ -9,6 +9,9 @@ public final class SagaTopics {
     // 오케스트레이터 -> payment
     public static final String PAYMENT_COMMANDS = "payment-commands";
 
+    // 오케스트레이터 -> payment (보상): 재고 실패 시 환불 명령
+    public static final String PAYMENT_REFUND_COMMANDS = "payment-refund-commands";
+
     // payment -> 오케스트레이터
     public static final String PAYMENT_REPLIES = "payment-replies";
 

@@ -2,6 +2,7 @@ package com.commerce.order.messaging;
 
 import com.commerce.order.messaging.command.DeductStockCommand;
 import com.commerce.order.messaging.command.ProcessPaymentCommand;
+import com.commerce.order.messaging.command.RefundPaymentCommand;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -25,5 +26,12 @@ public class SagaCommandPublisher {
         kafkaTemplate.send(SagaTopics.STOCK_COMMANDS, String.valueOf(command.orderId()), command);
         log.info("[order] DeductStock 명령 발행 -> topic={}, orderId={}",
                 SagaTopics.STOCK_COMMANDS, command.orderId());
+    }
+
+    // 재고 실패 시 이미 한 결제를 환불하라는 명령 발행
+    public void sendRefundPayment(RefundPaymentCommand command) {
+        kafkaTemplate.send(SagaTopics.PAYMENT_REFUND_COMMANDS, String.valueOf(command.orderId()), command);
+        log.info("[order] RefundPayment 명령 발행 -> topic={}, orderId={}",
+                SagaTopics.PAYMENT_REFUND_COMMANDS, command.orderId());
     }
 }
