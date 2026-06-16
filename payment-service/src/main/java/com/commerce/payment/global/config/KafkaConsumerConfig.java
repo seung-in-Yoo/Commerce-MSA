@@ -1,6 +1,5 @@
 package com.commerce.payment.global.config;
 
-import com.commerce.payment.messaging.event.OrderCreatedEvent;
 import com.commerce.payment.messaging.event.StockProcessedEvent;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -14,10 +13,6 @@ import org.springframework.kafka.support.serializer.JsonDeserializer;
 import java.util.HashMap;
 import java.util.Map;
 
-// payment는 두 종류의 이벤트를 구독한다(Saga + 보상)
-// order-events   : OrderCreated      (결제 시도)
-// product-events : StockProcessed    (재고 실패면 환불)
-// -> 타입별 전용 컨테이너 팩토리를 만들어 @KafkaListener로 분리
 @Configuration
 public class KafkaConsumerConfig {
 
@@ -45,11 +40,6 @@ public class KafkaConsumerConfig {
         ConcurrentKafkaListenerContainerFactory<String, T> factory = new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory);
         return factory;
-    }
-
-    @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent> orderCreatedListenerFactory() {
-        return typedFactory(OrderCreatedEvent.class);
     }
 
     @Bean
