@@ -1,6 +1,5 @@
 package com.commerce.order.global.config;
 
-import com.commerce.order.messaging.OrderEventPublisher;
 import com.commerce.order.messaging.SagaTopics;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.springframework.context.annotation.Bean;
@@ -9,14 +8,6 @@ import org.springframework.kafka.config.TopicBuilder;
 
 @Configuration
 public class KafkaTopicConfig {
-
-    @Bean
-    public NewTopic orderEventsTopic() {
-        return TopicBuilder.name(OrderEventPublisher.ORDER_EVENTS_TOPIC)
-                .partitions(1)
-                .replicas(1)
-                .build();
-    }
 
     // 오케스트레이션 채널 5개
     // 같은 주문의 메시지들이 순서를 지키도록 파티션은 1개

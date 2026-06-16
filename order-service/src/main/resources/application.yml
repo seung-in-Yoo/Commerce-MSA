@@ -24,7 +24,7 @@ spring:
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       properties:
         spring.json.add.type.headers: false
-    # order는 두 타입을 구독: product-events(StockProcessed) + payment-events(PaymentProcessed)
+    # order(오케스트레이터)는 payment-replies + stock-replies를 구독
     consumer:
       group-id: order-service
       auto-offset-reset: earliest
@@ -32,7 +32,7 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
         spring.json.use.type.headers: false
-        spring.json.value.default.type: com.commerce.order.messaging.event.StockProcessedEvent
+        spring.json.value.default.type: com.commerce.order.messaging.reply.PaymentProcessedReply
         spring.json.trusted.packages: "*"
 
 server:
