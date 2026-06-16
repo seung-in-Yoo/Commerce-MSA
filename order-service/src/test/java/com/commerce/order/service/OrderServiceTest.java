@@ -8,7 +8,7 @@ import com.commerce.order.dto.OrderResponse;
 import com.commerce.order.exception.OrderErrorCase;
 import com.commerce.order.fixture.OrderRequestFixture;
 import com.commerce.order.global.exception.ApplicationException;
-import com.commerce.order.messaging.OrderEventPublisher;
+import com.commerce.order.messaging.OrderSagaOrchestrator;
 import com.commerce.order.repository.OrderRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -44,14 +44,14 @@ class OrderServiceTest {
     private OrderRepository orderRepository;
 
     @Mock
-    private OrderEventPublisher orderEventPublisher;
+    private OrderSagaOrchestrator orchestrator;
 
     @Nested
     @DisplayName("createOrder")
     class CreateOrder {
 
         @Test
-        @DisplayName("성공 - 예상 단가로 total 산정·PENDING 저장, 이름은 null, 이벤트 발행")
+        @DisplayName("성공 - 예상 단가로 total 산정·PENDING 저장, 이름은 null, 사가 시작(결제 명령)")
         void success() {
             given(orderRepository.save(any(Order.class))).willAnswer(inv -> inv.getArgument(0));
 
@@ -64,7 +64,7 @@ class OrderServiceTest {
             assertThat(response.getTotalAmount()).isEqualTo(660000L);
             assertThat(response.getItems()).extracting(OrderItemResponse::getProductName).containsOnlyNulls();
             then(orderRepository).should().save(any(Order.class));
-            then(orderEventPublisher).should().publishOrderCreated(any());   // Saga 시작 이벤트 발행
+            then(orchestrator).should().start(any(Order.class));   // 오케스트레이터가 사가 시작
         }
 
         @Test
@@ -74,7 +74,7 @@ class OrderServiceTest {
 
             assertThatCode(() -> orderService.createOrder(OrderRequestFixture.defaultCreateRequest()))
                     .doesNotThrowAnyException();
-            then(orderEventPublisher).should().publishOrderCreated(any());
+            then(orchestrator).should().start(any(Order.class));
         }
     }
 
