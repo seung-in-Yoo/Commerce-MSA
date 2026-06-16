@@ -1,7 +1,7 @@
 package com.commerce.order.global.config;
 
-import com.commerce.order.messaging.event.StockProcessedEvent;
 import com.commerce.order.messaging.reply.PaymentProcessedReply;
+import com.commerce.order.messaging.reply.StockProcessedReply;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,7 +16,7 @@ import java.util.Map;
 
 // 오케스트레이터(order)는 타입이 다른 reply 토픽을 구독
 // payment-replies : PaymentProcessedReply
-// product-events  : StockProcessed
+// stock-replies   : StockProcessedReply
 @Configuration
 public class KafkaConsumerConfig {
 
@@ -47,12 +47,12 @@ public class KafkaConsumerConfig {
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, StockProcessedEvent> stockProcessedListenerFactory() {
-        return typedFactory(StockProcessedEvent.class);
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentProcessedReply> paymentProcessedReplyListenerFactory() {
+        return typedFactory(PaymentProcessedReply.class);
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, PaymentProcessedReply> paymentProcessedReplyListenerFactory() {
-        return typedFactory(PaymentProcessedReply.class);
+    public ConcurrentKafkaListenerContainerFactory<String, StockProcessedReply> stockProcessedReplyListenerFactory() {
+        return typedFactory(StockProcessedReply.class);
     }
 }
