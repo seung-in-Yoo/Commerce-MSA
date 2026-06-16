@@ -6,8 +6,7 @@ import com.commerce.order.dto.CreateOrderRequest;
 import com.commerce.order.dto.OrderResponse;
 import com.commerce.order.exception.OrderErrorCase;
 import com.commerce.order.global.exception.ApplicationException;
-import com.commerce.order.messaging.OrderEventPublisher;
-import com.commerce.order.messaging.event.OrderCreatedEvent;
+import com.commerce.order.messaging.OrderSagaOrchestrator;
 import com.commerce.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -21,26 +20,17 @@ import java.util.List;
 public class OrderService {
 
     private final OrderRepository orderRepository;
-    private final OrderEventPublisher orderEventPublisher;
+    private final OrderSagaOrchestrator orchestrator;
 
     @Transactional
     public OrderResponse createOrder(CreateOrderRequest request) {
-        // product를 동기 호출하지 않는다
-        // 주문은 자기가 아는 것(productId, quantity)만으로 먼저 생성하고,
-        // 재고 차감은 OrderCreated 이벤트로 product-service에 비동기로 위임
+        // 주문은 자기가 productId, quantity, 예상 단가만으로 먼저 PENDING으로 저장
         Order order = Order.create(request.customerId());
         request.items().forEach(line -> order.addItem(line.productId(), line.quantity(), line.unitPrice()));
         Order saved = orderRepository.save(order);
 
-        // payment가 먼저 구독해 결제를 시도하고(amount), 그 다음 product가 재고를 깎음
-        OrderCreatedEvent event = new OrderCreatedEvent(
-                saved.getId(),
-                saved.getCustomerId(),
-                saved.getTotalAmount(),
-                saved.getItems().stream()
-                        .map(item -> new OrderCreatedEvent.Item(item.getProductId(), item.getQuantity()))
-                        .toList());
-        orderEventPublisher.publishOrderCreated(event);
+        // 오케스트레이터가 사가를 직접 시작(결제부터 명령)
+        orchestrator.start(saved);
 
         return OrderResponse.from(saved);
     }
