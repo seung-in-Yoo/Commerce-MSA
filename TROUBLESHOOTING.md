@@ -4,11 +4,89 @@
 
 ## 목차
 
-| ID | 날짜 | 단계 | 한 줄 요약 |
-|---|---|---|---|
-| [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비 |
-| [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500) |
-| [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`) |
+| ID | 날짜 | 단계 | 한 줄 요약                                                                 |
+|---|---|---|------------------------------------------------------------------------|
+| [TS-4](#ts-4--멀티타입-컨슈머에서-단일-valuedefaulttype의-한계) | 2026-06-16 | step4b | 두 토픽 구독 컨슈머에서 `containerFactory` 설정 없음 → 단일 default 타입이 다른 타입을 못 받고 깨짐 |
+| [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비             |
+| [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)              |
+| [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                         |
+
+---
+
+## TS-4 — 멀티타입 컨슈머에서 단일 `value.default.type`의 한계 
+
+- **날짜**: 2026-06-16
+- **단계**: step4b (payment 추가, 주문→결제→재고 3-step Saga)
+
+### 배경 — payment는 타입이 다른 두 토픽을 구독한다
+
+```
+OrderEventListener  : order-events   → OrderCreatedEvent  기대 (결제 시도)
+StockResultListener : product-events → StockProcessedEvent 기대 (재고 실패면 환불)
+```
+
+그런데 `application.yml`의 컨슈머 설정은 역직렬화 타입을 **딱 하나만** 지정할 수 있다:
+
+```yaml
+spring.json.value.default.type: com.commerce.payment.messaging.event.OrderCreatedEvent
+```
+
+### 증상
+
+**정상 주문 하나**(한도 이하 + 재고 충분)를 넣음 -> 결제는 멀쩡히 승인됐는데, 재고 결과를 받는 순간 payment가 터졌다:
+
+```
+[payment] 결제 승인(APPROVED) -> orderId=2, paymentId=2        ← order-events는 정상
+ERROR o.s.kafka.listener.DefaultErrorHandler :
+       Backoff FixedBackOff{interval=0, currentAttempts=1, maxAttempts=0} exhausted for product-events-0@1
+
+org.springframework.kafka.listener.ListenerExecutionFailedException: Listener method could not be invoked
+  Method [StockResultListener.onStockProcessed(StockProcessedEvent)]
+Caused by: org.springframework.messaging.converter.MessageConversionException:
+  Cannot convert from [com.commerce.payment.messaging.event.OrderCreatedEvent]
+                  to [com.commerce.payment.messaging.event.StockProcessedEvent]
+  for payload=OrderCreatedEvent[orderId=2, customerId=null, amount=0, items=[Item[productId=1, quantity=0]]],
+      headers={... kafka_receivedTopic=product-events ...}
+```
+
+- **`order-events`(OrderCreated) 리스너는 정상** — default 타입과 일치하므로 결제 승인까지 잘 된다(대조군).
+- **`product-events`(StockProcessed) 리스너만 깨진다**. 같은 서비스·같은 설정인데 한쪽만 죽는다.
+
+### 원인 — 단일 default 타입은 "한 타입"만 섬긴다
+
+1. `containerFactory`설정이 없으면 두 리스너 모두 **기본 팩토리**를 쓰고, 기본 팩토리의 역직렬화 타입은 `value.default.type` **하나(`OrderCreatedEvent`)** 뿐이다.
+2. `product-events`로 온 `StockProcessed` JSON을 **`OrderCreatedEvent`로 강제 역직렬화**한다. 그런데 **이 단계에선 예외가 안 난다** — `StockProcessed`에만 있는 `result`/`reasonCode`/`productName`/`unitPrice`는 *조용히 버려지고*, `OrderCreatedEvent`에만 있는 `amount`·`quantity`는 JSON에 없어 **0으로 채워진** 잘못된 객체가 만들어진다. (로그의 `amount=0, quantity=0`)
+3. **그다음 메서드 인자 바인딩 단계**에서 `OrderCreatedEvent → StockProcessedEvent` 변환 불가로 `MessageConversionException`이 터짐 
+4. `Backoff ... maxAttempts=0 exhausted` → **재시도 없이 즉시 포기하고 offset을 커밋** = 그 메시지는 **그냥 버려짐**
+
+### 해결 — 타입별 전용 컨테이너 팩토리 
+
+`KafkaConsumerConfig`에서 타입마다 `JsonDeserializer`를 못박은 `ConcurrentKafkaListenerContainerFactory`를 만들고, 리스너가 `containerFactory`로 자기 타입 팩토리를 지정:
+
+```java
+private <T> ConcurrentKafkaListenerContainerFactory<String, T> typedFactory(Class<T> type) {
+    JsonDeserializer<T> valueDeserializer = new JsonDeserializer<>(type, false); // 이 팩토리는 이 타입만
+    valueDeserializer.addTrustedPackages("*");
+    // ... DefaultKafkaConsumerFactory(props, StringDeserializer, valueDeserializer) ...
+}
+
+@Bean ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent>  orderCreatedListenerFactory()  { return typedFactory(OrderCreatedEvent.class); }
+@Bean ConcurrentKafkaListenerContainerFactory<String, StockProcessedEvent> stockProcessedListenerFactory() { return typedFactory(StockProcessedEvent.class); }
+```
+
+```java
+@KafkaListener(topics = "order-events",   containerFactory = "orderCreatedListenerFactory")
+@KafkaListener(topics = "product-events", containerFactory = "stockProcessedListenerFactory")
+```
+
+order-service도 같은 이유로 동일 구조(`PaymentProcessedEvent`/`StockProcessedEvent` 두 팩토리)를 가진다.
+
+### 교훈
+
+- **`spring.json.value.default.type`은 컨슈머당 정확히 한 타입만 섬긴다.** 한 서비스가 타입이 다른 토픽을 둘 이상 구독하면 단일 default로는 부족하다 → **타입별 `containerFactory`가 필수.**
+- **타입 안 맞는 역직렬화의 진짜 위험은 "깨짐"이 아니라 "조용하게 지나감"이다.** 역직렬화는 성공해버리고(`amount=0`처럼 기본값으로 채운 *틀린 객체* 생성), 운 나쁘면 타입까지 우연히 맞아 **예외 없이 잘못된 비즈니스 동작**을 한다. 
+- **`product-service`는 왜 `containerFactory`가 없나?** payment-events 한 토픽만 구독 = 타입이 하나뿐이라 default로 충분하다. **2개 이상 구독하는 서비스(order, payment)만** 타입별 팩토리가 필요하다. "필요해질 때 도입"의 좋은 예.
+- **기본 에러 핸들러는 변환 실패를 재시도 없이 스킵할 수 있다**(`maxAttempts=0`). 만약 이게 `StockProcessed(FAILED)`였다면 **환불(보상)이 영원히 일어나지 않고 사슬이 침묵 속에 끊긴다.** choreography에서 한 컨슈머의 조용한 실패가 전체 Saga 정합성을 깨뜨릴 수 있다.
 
 ---
 
