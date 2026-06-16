@@ -1,5 +1,6 @@
 package com.commerce.order.messaging;
 
+import com.commerce.order.messaging.command.DeductStockCommand;
 import com.commerce.order.messaging.command.ProcessPaymentCommand;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -18,5 +19,11 @@ public class SagaCommandPublisher {
         kafkaTemplate.send(SagaTopics.PAYMENT_COMMANDS, String.valueOf(command.orderId()), command);
         log.info("[order] ProcessPayment 명령 발행 -> topic={}, orderId={}, amount={}",
                 SagaTopics.PAYMENT_COMMANDS, command.orderId(), command.amount());
+    }
+
+    public void sendDeductStock(DeductStockCommand command) {
+        kafkaTemplate.send(SagaTopics.STOCK_COMMANDS, String.valueOf(command.orderId()), command);
+        log.info("[order] DeductStock 명령 발행 -> topic={}, orderId={}",
+                SagaTopics.STOCK_COMMANDS, command.orderId());
     }
 }
