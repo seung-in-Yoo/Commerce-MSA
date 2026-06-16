@@ -1,7 +1,7 @@
 package com.commerce.order.global.config;
 
-import com.commerce.order.messaging.event.PaymentProcessedEvent;
-import com.commerce.order.messaging.event.StockProcessedEvent;
+import com.commerce.order.messaging.reply.PaymentProcessedReply;
+import com.commerce.order.messaging.reply.StockProcessedReply;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,10 +14,9 @@ import org.springframework.kafka.support.serializer.JsonDeserializer;
 import java.util.HashMap;
 import java.util.Map;
 
-// order는 이제 두 종류의 결과 이벤트를 구독(Saga 보상)
-// product-events : StockProcessed     (재고 결과 -> CONFIRMED/CANCELLED)
-// payment-events : PaymentProcessed   (결제 결과 -> FAILED면 즉시 CANCELLED)
-// -> 타입별 전용 컨테이너 팩토리를 만들어 @KafkaListener로 분리
+// 오케스트레이터(order)는 타입이 다른 reply 토픽을 구독
+// payment-replies : PaymentProcessedReply
+// stock-replies   : StockProcessedReply
 @Configuration
 public class KafkaConsumerConfig {
 
@@ -48,12 +47,12 @@ public class KafkaConsumerConfig {
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, StockProcessedEvent> stockProcessedListenerFactory() {
-        return typedFactory(StockProcessedEvent.class);
+    public ConcurrentKafkaListenerContainerFactory<String, PaymentProcessedReply> paymentProcessedReplyListenerFactory() {
+        return typedFactory(PaymentProcessedReply.class);
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, PaymentProcessedEvent> paymentProcessedListenerFactory() {
-        return typedFactory(PaymentProcessedEvent.class);
+    public ConcurrentKafkaListenerContainerFactory<String, StockProcessedReply> stockProcessedReplyListenerFactory() {
+        return typedFactory(StockProcessedReply.class);
     }
 }

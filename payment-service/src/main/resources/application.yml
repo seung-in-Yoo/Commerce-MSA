@@ -31,7 +31,8 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
         spring.json.use.type.headers: false
-        spring.json.value.default.type: com.commerce.payment.messaging.event.OrderCreatedEvent
+        # 두 command 리스너 모두 KafkaConsumerConfig의 typed factory를 쓰므로 default type은 실질적으로 미사용
+        spring.json.value.default.type: com.commerce.payment.messaging.command.ProcessPaymentCommand
         spring.json.trusted.packages: "*"
 
 # 결제 승인 규칙: 금액이 한도를 넘으면 승인 거절(FAILED)

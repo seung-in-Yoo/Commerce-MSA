@@ -1,11 +1,10 @@
-package com.commerce.order.messaging.event;
+package com.commerce.order.messaging.command;
 
 import java.util.List;
 
-public record OrderCreatedEvent(
+// 오케스트레이터 -> product (stock-commands 토픽)
+public record DeductStockCommand(
         Long orderId,
-        Long customerId,
-        long amount,
         List<Item> items
 ) {
     public record Item(

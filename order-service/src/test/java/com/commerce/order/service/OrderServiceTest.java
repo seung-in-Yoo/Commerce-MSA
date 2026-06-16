@@ -2,13 +2,12 @@ package com.commerce.order.service;
 
 import com.commerce.order.domain.Order;
 import com.commerce.order.domain.OrderStatus;
-import com.commerce.order.domain.ProductSnapshot;
 import com.commerce.order.dto.OrderItemResponse;
 import com.commerce.order.dto.OrderResponse;
 import com.commerce.order.exception.OrderErrorCase;
 import com.commerce.order.fixture.OrderRequestFixture;
 import com.commerce.order.global.exception.ApplicationException;
-import com.commerce.order.messaging.OrderEventPublisher;
+import com.commerce.order.messaging.OrderSagaOrchestrator;
 import com.commerce.order.repository.OrderRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -30,7 +29,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -44,14 +42,14 @@ class OrderServiceTest {
     private OrderRepository orderRepository;
 
     @Mock
-    private OrderEventPublisher orderEventPublisher;
+    private OrderSagaOrchestrator orchestrator;
 
     @Nested
     @DisplayName("createOrder")
     class CreateOrder {
 
         @Test
-        @DisplayName("성공 - 예상 단가로 total 산정·PENDING 저장, 이름은 null, 이벤트 발행")
+        @DisplayName("성공 - 예상 단가로 total 산정·PENDING 저장, 이름은 null, 사가 시작(결제 명령)")
         void success() {
             given(orderRepository.save(any(Order.class))).willAnswer(inv -> inv.getArgument(0));
 
@@ -64,7 +62,7 @@ class OrderServiceTest {
             assertThat(response.getTotalAmount()).isEqualTo(660000L);
             assertThat(response.getItems()).extracting(OrderItemResponse::getProductName).containsOnlyNulls();
             then(orderRepository).should().save(any(Order.class));
-            then(orderEventPublisher).should().publishOrderCreated(any());   // Saga 시작 이벤트 발행
+            then(orchestrator).should().start(any(Order.class));   // 오케스트레이터가 사가 시작
         }
 
         @Test
@@ -74,7 +72,7 @@ class OrderServiceTest {
 
             assertThatCode(() -> orderService.createOrder(OrderRequestFixture.defaultCreateRequest()))
                     .doesNotThrowAnyException();
-            then(orderEventPublisher).should().publishOrderCreated(any());
+            then(orchestrator).should().start(any(Order.class));
         }
     }
 
@@ -108,52 +106,6 @@ class OrderServiceTest {
                     .isInstanceOf(ApplicationException.class)
                     .extracting(e -> ((ApplicationException) e).getErrorCase())
                     .isEqualTo(OrderErrorCase.ORDER_NOT_FOUND);
-        }
-    }
-
-    @Nested
-    @DisplayName("confirmOrder")
-    class ConfirmOrder {
-
-        @Test
-        @DisplayName("성공 - 주문을 찾아 스냅샷 적용 후 CONFIRMED, total 재계산")
-        void success() {
-            Order order = Order.create(1L);
-            order.addItem(100L, 2, 25000L);   // 예상 단가 25000 → 확정 시 실제 단가 30000으로 덮어쓰여 재계산
-            given(orderRepository.findById(1L)).willReturn(Optional.of(order));
-
-            orderService.confirmOrder(1L, List.of(new ProductSnapshot(100L, "키보드", 30000L)));
-
-            assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
-            assertThat(order.getTotalAmount()).isEqualTo(60000L);
-        }
-
-        @Test
-        @DisplayName("실패 - 존재하지 않는 주문 → ORDER_NOT_FOUND")
-        void notFound() {
-            given(orderRepository.findById(99L)).willReturn(Optional.empty());
-
-            assertThatThrownBy(() -> orderService.confirmOrder(99L, List.of()))
-                    .isInstanceOf(ApplicationException.class)
-                    .extracting(e -> ((ApplicationException) e).getErrorCase())
-                    .isEqualTo(OrderErrorCase.ORDER_NOT_FOUND);
-        }
-    }
-
-    @Nested
-    @DisplayName("cancelOrder")
-    class CancelOrder {
-
-        @Test
-        @DisplayName("성공 - 주문을 찾아 CANCELLED로 전이")
-        void success() {
-            Order order = Order.create(1L);
-            order.addItem(100L, 2, 30000L);
-            given(orderRepository.findById(1L)).willReturn(Optional.of(order));
-
-            orderService.cancelOrder(1L);
-
-            assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
         }
     }
 }

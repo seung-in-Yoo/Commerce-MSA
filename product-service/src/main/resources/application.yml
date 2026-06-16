@@ -34,7 +34,7 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
         spring.json.use.type.headers: false
-        spring.json.value.default.type: com.commerce.product.messaging.event.PaymentProcessedEvent
+        spring.json.value.default.type: com.commerce.product.messaging.command.DeductStockCommand
         spring.json.trusted.packages: "*"
 
 server:
