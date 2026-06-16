@@ -1,6 +1,7 @@
 package com.commerce.payment.global.config;
 
-import com.commerce.payment.messaging.event.StockProcessedEvent;
+import com.commerce.payment.messaging.command.ProcessPaymentCommand;
+import com.commerce.payment.messaging.command.RefundPaymentCommand;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,6 +14,9 @@ import org.springframework.kafka.support.serializer.JsonDeserializer;
 import java.util.HashMap;
 import java.util.Map;
 
+// payment는 타입이 다른 두 command 토픽을 구독
+// payment-commands        : ProcessPaymentCommand (결제)
+// payment-refund-commands : RefundPaymentCommand  (환불 보상)
 @Configuration
 public class KafkaConsumerConfig {
 
@@ -43,7 +47,12 @@ public class KafkaConsumerConfig {
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, StockProcessedEvent> stockProcessedListenerFactory() {
-        return typedFactory(StockProcessedEvent.class);
+    public ConcurrentKafkaListenerContainerFactory<String, ProcessPaymentCommand> processPaymentCommandListenerFactory() {
+        return typedFactory(ProcessPaymentCommand.class);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, RefundPaymentCommand> refundPaymentCommandListenerFactory() {
+        return typedFactory(RefundPaymentCommand.class);
     }
 }
