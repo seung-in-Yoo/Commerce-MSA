@@ -20,7 +20,8 @@ public class PaymentCommandListener {
     private final PaymentService paymentService;
     private final PaymentReplyPublisher paymentReplyPublisher;
 
-    @KafkaListener(topics = "payment-commands")
+    // payment가 두 command 타입(결제/환불)을 구독하므로 타입별 전용 팩토리 지정
+    @KafkaListener(topics = "payment-commands", containerFactory = "processPaymentCommandListenerFactory")
     public void onProcessPayment(ProcessPaymentCommand command) {
         log.info("[payment] ProcessPayment 명령 수신 <- orderId={}, amount={}",
                 command.orderId(), command.amount());
