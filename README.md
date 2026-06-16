@@ -11,8 +11,9 @@
 3. ✅ 동기 호출을 Kafka 이벤트로 전환 (3a 발행/수신 추가 → 3b 동기 제거, 완전 비동기)
 4. **[현재] Saga(choreography vs orchestration), Outbox, eventual consistency**
    - ✅ 4a choreography 보상 (order↔product)
-   - ✅ 4b payment 추가 → 주문→결제→재고 **3-step Saga + 보상 사슬**
-   - ⬜ 4c orchestration 대조 · 4d 멱등성 · 4e Outbox
+   - ✅ 4b payment 추가 → 주문→결제→재고 **3-step Saga + 보상 사슬** (choreography)
+   - ✅ 4c orchestration 대조 — 중앙 오케스트레이터 + command/reply
+   - ⬜ 4d 멱등성 · 4e Outbox
 5. ⬜ API Gateway, 분산 추적, Circuit Breaker(Resilience4j)
 
 ## 지키는 습관 (12-factor / k8s 대비)
@@ -35,22 +36,26 @@
 
 컨테이너 안에서는 브로커를 `kafka:9092`로, 맥에서 IDE로 직접 띄울 땐 `localhost:9094`로 접속한다.
 
-## 아키텍처 — 비동기 Saga (현재)
+## 아키텍처 — orchestration Saga (현재, 4c)
 
-서비스 간은 **동기 호출이 아니라 Kafka 이벤트**로 잇는다. 주문 1건이 세 서비스를 거치며 흐른다(choreography — 중앙 조정자 없음):
+서비스 간은 Kafka로 잇되, **중앙 오케스트레이터(order 내장 `OrderSagaOrchestrator`)가 흐름을 구성**한다.
+토픽은 event가 아니라 **명령(command)/응답(reply)** 채널이다. 주문 1건이 오케스트레이터의 결정에 따라 단계별로 흐른다:
 
 ```
-order   주문(PENDING) ─OrderCreated(amount,items)──▶ order-events
-payment   결제 승인 ────PaymentProcessed(APPROVED,items)──▶ payment-events
-product   재고 차감 ─────StockProcessed(DEDUCTED,이름/단가)──▶ product-events
-order   주문 CONFIRMED (product가 준 실제 단가로 total 재계산)
-
-보상① 결제 거절: PaymentProcessed(FAILED) ─▶ order 즉시 CANCELLED (재고 진입 안 함)
-보상② 재고 실패: StockProcessed(FAILED)  ─▶ order CANCELLED + payment REFUNDED (이미 한 결제를 되돌림)
+order(오케스트레이터)  주문(PENDING) → 사가 시작
+  └─ ProcessPayment ─▶ payment-commands ─▶ payment: 결제
+       └─ PaymentProcessedReply ─▶ payment-replies ─▶ 오케스트레이터
+            ├─ APPROVED → DeductStock ─▶ stock-commands ─▶ product: 재고 차감
+            │    └─ StockProcessedReply ─▶ stock-replies ─▶ 오케스트레이터
+            │         ├─ DEDUCTED → 주문 CONFIRMED (product가 준 실제 단가로 total 재계산)
+            │         └─ FAILED   → RefundPayment ─▶ payment-refund-commands ─▶ payment 환불(REFUNDED) + 주문 CANCELLED  (보상②)
+            └─ FAILED   → 주문 CANCELLED  (보상①, 재고 진입 안 함)
 ```
 
+- **payment/product는 "명령 받아 처리 → 응답"만** 한다. "다음에 뭘 할지"는 전부 오케스트레이터가 결정 → 서비스끼리 서로를 모른다(4b choreography에선 각 서비스가 다음 단계를 암묵적으로 알아야 했음).
 - 결제가 재고보다 **먼저**라, 주문 생성 시 클라가 보낸 **예상 단가**로 결제 금액(`amount`)을 만든다. 상품의 **진짜 이름/단가는 재고 차감 후 product가 채운다**(order는 상품을 JOIN하지 않는다).
-- order·payment는 결과 이벤트를 **여러 타입** 구독하므로 타입별 컨슈머 팩토리(`KafkaConsumerConfig`)로 역직렬화를 분리한다.
+- order·payment는 타입이 다른 토픽을 **둘씩** 구독하므로 타입별 컨슈머 팩토리(`KafkaConsumerConfig`)로 역직렬화를 분리한다.
+- choreography(4b) ↔ orchestration(4c) 대조는 [LEARNING_JOURNEY.md](./LEARNING_JOURNEY.md) Step 4b·4c 참고.
 
 ## 실행 방법
 
@@ -93,7 +98,7 @@ curl http://localhost:8081/api/v1/products/1
 ```
 
 흐름을 로그로 보려면: `docker compose logs -f order-service payment-service product-service`
-(`OrderCreated 발행 → 결제 승인 → 재고 차감 → 주문 확정` 한 바퀴가 보인다.)
+(`[order] 사가 시작 → 결제 명령 → 결제 승인 → 재고 차감 명령 → 재고 차감 → 주문 확정` 한 바퀴가 오케스트레이터 주도로 보인다.)
 
 ### 동작 확인 ② 보상 — 결제 거절 
 

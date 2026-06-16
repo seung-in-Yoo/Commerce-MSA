@@ -13,8 +13,9 @@
 | 3a | 동기 호출의 시간 결합 | Kafka 도입 — 이벤트 발행/수신을 **추가만**(동기는 유지) | 발행은 하는데 정작 결합은 안 끊김(동기가 그대로라) |
 | 3b | 동기 호출이 남아 결합이 안 끊김 | 동기 호출 **제거**, 완전 비동기 전환 | **주문은 됐는데 재고가 안 깎이는 불일치** (order는 모름) → step4 |
 | 4a | 비동기 불일치(주문은 됐는데 재고 결과를 order가 모름) | **choreography Saga** — product가 결과를 역방향 이벤트로, order가 받아 `CONFIRMED`/`CANCELLED`(+ 이름/가격 채움) | 단계가 늘면 보상 사슬·중복 소비·발행 원자성 문제 → 4b~4e |
-| 4b | 보상이 "주문 취소" 하나뿐 — 보상 사슬·스타일 대조가 안 보임 | **payment 추가 3-step Saga** — 주문→결제→재고, 재고 실패 시 **결제 환불 + 주문 취소** 보상 사슬 | 한 컨슈머가 이벤트 타입 2개↑(단일 default.type 한계), 멱등성 X, 발행 원자성 X → 4c~4e |
-| 4c~4e (예정) | (4b에서 이어짐) | orchestration 대조 / 멱등성 / Outbox | … |
+| 4b | 보상이 "주문 취소" 하나뿐 — 보상 사슬·스타일 대조가 안 보임 | **payment 추가 3-step Saga** — 주문→결제→재고, 재고 실패 시 **결제 환불 + 주문 취소** 보상 사슬 | 흐름이 5개 리스너에 흩어져 추적이 어려움 → 4c |
+| 4c | choreography는 "다음에 뭘 할지"가 각 서비스에 흩어져 전체 흐름이 코드 어디에도 없음 | **orchestration** — 중앙 오케스트레이터가 command/reply로 전 단계를 지휘, 흐름이 한 클래스로 모임 | 흐름은 모였으나 멱등성 X·발행 원자성 X는 그대로 → 4d~4e |
+| 4d~4e (예정) | (4c에서 이어짐) | 멱등성 / Outbox | … |
 
 ---
 
@@ -359,6 +360,101 @@ docker compose로 7개 컨테이너(서비스3 + DB3 + kafka) 띄우고 3종:
 
 ---
 
+## Step 4c — orchestration Saga (중앙 오케스트레이터 + command/reply)
+
+### 직전의 고통
+4b(choreography)는 **"주문→결제→재고+보상"이라는 한 트랜잭션이 5개 리스너(order 2·payment 2·product 1)에 흩어져** 있었다. "지금 어디서 뭐가 도는지"를 보려면 파일을 다 열어 머릿속으로 이어붙여야 했고, **전체 흐름이 코드 어디에도 없다**는 게 핵심 
+
+### 핵심 개념 — choreography vs orchestration
+| | choreography (4b) | orchestration (4c) |
+|---|---|---|
+| 다음 단계를 누가 결정? | **아무도 안 함** — 각자 이벤트 듣고 스스로 판단 | **오케스트레이터가 결정** — 명령을 내림 |
+| 전체 흐름이 보이는 곳 | 없음(리스너에 분산) | **오케스트레이터 한 클래스** |
+| 토픽 성격 | 알림(event): "~가 일어났다" | **명령(command)/응답(reply)**: "~해라" / "~됐다" |
+| 서비스끼리 아는 사이? | payment가 "내 다음은 product"임을 암묵적으로 앎 | payment/product는 **오케스트레이터만** 알면 됨 |
+
+choreography의 목적은 **같은 흐름을 중앙 조정자로 재구현해 두 스타일을 대조**하는 것(기능은 4b와 동일)
+
+### 설계 결정
+- **토픽을 알림 → 명령/응답으로 재설계**: `payment-commands`/`payment-replies`/`stock-commands`/`stock-replies`. 환불은 결제 명령과 타입이 달라 별도 토픽 `payment-refund-commands`로 분리(토픽당 타입 1개 → typed factory가 깔끔).
+- **오케스트레이터(`OrderSagaOrchestrator`)를 order에 내장**: 사가를 시작하는 서비스가 조정도 맡음. 새 서비스를 안 만들어 부담↓(학습 선택). *트레이드오프*: order에 결합되고, 규모 커지면 "조정자가 어느 서비스에 있나" 찾기 어려움 → 그땐 **전용 orchestrator-service + 분산추적(5단계)**이 정석. ("중앙"은 시스템 전체가 아니라 **사가 1개당 1개**.)
+- **순환참조 회피**: `OrderService`가 사가 시작(`orchestrator.start`)으로 오케스트레이터를 의존하므로, 거꾸로 오케스트레이터는 `OrderService` 대신 **`OrderRepository`를 직접** 써서 주문 확정/취소를 처리(서로 물면 스프링 기동 실패).
+- **payment/product는 일꾼으로 단순화**: "명령 받아 처리 → 응답"만. "다음에 뭘 할지" 판단 책임이 전부 오케스트레이터로 이동(product의 "결제 APPROVED인지" 가드도 사라짐).
+
+오케스트레이터 = 작은 상태기계(메서드 3개 = 사가 3단계):
+```
+start          → 결제 명령(ProcessPayment)
+onPaymentReply → 승인: 재고 명령(DeductStock) / 거절: 주문 취소
+onStockReply   → 차감성공: 주문 확정(CONFIRMED) / 실패: 환불 명령(RefundPayment) + 주문 취소
+```
+
+### 무엇을 만들었나 (조각별)
+- **1 · 어휘**: command(ProcessPayment/DeductStock/RefundPayment) + reply(PaymentProcessedReply/StockProcessedReply) record, `SagaTopics`, 토픽 5개 선언.
+- **2 · 시작점**: `createOrder` → `OrderCreated` 발행을 **`orchestrator.start()` 호출로 교체** + `SagaCommandPublisher`.
+- **3 · payment**: `order-events` 구독을 → `payment-commands` 구독으로, `payment-events` 발행을 → `payment-replies`로.
+- **4 · 오케스트레이터 결제 응답**: `payment-replies` 구독 → 승인 시 재고 명령 / 거절 시 취소.
+- **5 · product**: `payment-events` 구독을 → `stock-commands`로, `product-events` 발행을 → `stock-replies`로.
+- **6 · 오케스트레이터 재고 응답**: `stock-replies` 구독 → 확정 / 실패 시 환불 명령 + 취소.
+- **7 · 환불 보상**: payment `RefundCommandListener`(`payment-refund-commands` 구독 → 환불).
+- **8 · 정리**: 4b choreography 잔재(event/publisher/listener, `OrderService.confirm/cancel`) 전면 제거.
+
+### 새 개념 / 재사용 — typed factory (TS-4 패턴 복귀)
+오케스트레이터는 `payment-replies`+`stock-replies`, payment는 `payment-commands`+`payment-refund-commands` — **타입이 다른 토픽을 둘씩 구독**한다. 단일 `value.default.type`은 한 타입만 → 4b에서 배운 **타입별 `containerFactory`**를 그대로 적용. (product는 `stock-commands` 하나뿐이라 default로 충분 → 비대칭이 "필요할 때만 도입"을 보여줌.)
+
+### 직접 관찰한 것
+docker 7개 컨테이너 + 상품 등록(키보드 30000/재고100, 마우스 15000/재고100) 후 3종. **로그에서 `[order]`(오케스트레이터)가 매 단계 "결정"을 주도**하는 게 4b의 "각자 알아서"와 대조된다.
+
+#### 1. 정상 → CONFIRMED (키보드 2개, amount 6만)
+```
+[order]   사가 시작 -> 결제 명령 결정 orderId=1, amount=60000
+[order]   ProcessPayment 명령 발행 -> topic=payment-commands, orderId=1
+[payment] ProcessPayment 명령 수신 <- orderId=1, amount=60000
+[payment] PaymentProcessed 응답 발행 -> topic=payment-replies, orderId=1, result=APPROVED
+[order]   PaymentProcessed 응답 수신 <- orderId=1, result=APPROVED
+[order]   DeductStock 명령 발행 -> topic=stock-commands, orderId=1
+[order]   결제 승인 -> 재고 차감 명령 결정 orderId=1
+[product] DeductStock 명령 수신 <- orderId=1, items=[Item[productId=1, quantity=2]]
+[product] StockProcessed 응답 발행 -> topic=stock-replies, orderId=1, result=DEDUCTED
+[order]   StockProcessed 응답 수신 <- orderId=1, result=DEDUCTED
+[order]   재고 차감 성공 -> 주문 확정(CONFIRMED) orderId=1
+```
+GET /orders/1 → `CONFIRMED, total 60000, 키보드/30000`. 재고 100→98.
+
+#### 2. 결제 거절 → CANCELLED (보상①, 재고 무손) (키보드 40개, amount 120만 > 한도)
+```
+[payment] ProcessPayment 명령 수신 <- orderId=2, amount=1200000
+[payment] PaymentProcessed 응답 발행 -> topic=payment-replies, orderId=2, result=FAILED
+[payment] 결제 거절(FAILED) -> orderId=2, amount=1200000
+[order]   PaymentProcessed 응답 수신 <- orderId=2, result=FAILED
+[order]   결제 거절 -> 주문 취소(CANCELLED) orderId=2, reason=PAYMENT_LIMIT_EXCEEDED
+```
+GET /orders/2 → `CANCELLED`. 재고 98 그대로, **`[product]` 로그가 아예 없음**(재고 단계 진입조차 안 함).
+
+#### 3. 재고 실패 → CANCELLED + REFUNDED (보상② 사슬) (키보드 999개·단가 1000, amount 99.9만 ≤ 한도지만 999 > 재고 98)
+```
+[payment] 결제 승인(APPROVED) -> orderId=3, paymentId=2        ← 결제는 이미 일어남
+[order]   PaymentProcessed 응답 수신 <- orderId=3, result=APPROVED
+[order]   DeductStock 명령 발행 -> topic=stock-commands, orderId=3
+[product] DeductStock 명령 수신 <- orderId=3, items=[Item[productId=1, quantity=999]]
+[product] 재고 차감 실패 -> orderId=3, code=PRODUCT_002 -> StockProcessed(FAILED) 응답
+[product] StockProcessed 응답 발행 -> topic=stock-replies, orderId=3, result=FAILED
+[order]   StockProcessed 응답 수신 <- orderId=3, result=FAILED
+[order]   RefundPayment 명령 발행 -> topic=payment-refund-commands, orderId=3
+[order]   재고 실패 -> 결제 환불 명령 + 주문 취소(CANCELLED) orderId=3, reason=PRODUCT_002
+[payment] RefundPayment 명령 수신 <- orderId=3
+[payment] 결제 환불(REFUNDED) -> orderId=3
+```
+GET /orders/3 → `CANCELLED`, 결제 `REFUNDED`, 재고 98 그대로. **오케스트레이터가 "환불해라"라고 명령**해서 이미 한 결제가 되돌려진다(4b는 payment가 product-events를 직접 듣고 스스로 환불했음 — 판단 주체가 다름)
+
+### 배운 것
+- **orchestration = "흐름을 한 곳에 모은다".** 파일 개수는 4b와 비슷하지만, "다음에 뭘 할지"의 결정이 `OrderSagaOrchestrator` 한 클래스에 모여 **"전체 흐름이 어디 있냐"의 답이 한 곳**이 된다. 이게 choreography의 "추적 어려움"에 대한 답
+- **command(명령) vs event(알림)는 의도가 다르다.** event는 "~가 일어났다"(받는 쪽이 알아서), command는 "~해라"(보내는 쪽이 흐름을 쥠). 같은 Kafka지만 토픽의 *의미*가 바뀐다
+- **판단 책임의 이동.** 4b에선 각 서비스가 "내 다음 단계"를 알아야 했는데(결합), 4c에선 payment/product가 오케스트레이터만 알면 돼서 서로 모른다 → 서비스는 더 단순·독립적, 대신 오케스트레이터가 비대해짐(트레이드오프)
+- **트레이드오프 정리**: choreography(분산·단순한 서비스·흐름 추적 어려움) ↔ orchestration(중앙·흐름 명확·조정자 단일 책임 집중/SPOF 성격). 어느 쪽도 정답 아님 — 흐름 복잡도·팀 구조에 따라 고른다
+- **남은 한계는 그대로**: 예상가<->실제가, 중복 소비(멱등성 X → 4d), DB저장+발행 비원자성(Outbox → 4e). command/reply 발행도 트랜잭션과 별개(dual-write)라 4e 대상
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -370,9 +466,8 @@ docker compose로 7개 컨테이너(서비스3 + DB3 + kafka) 띄우고 3종:
 
 ---
 
-## 다음 — Step 4c~4e 예고
+## 다음 — Step 4d~4e 예고
 
-4b로 payment까지 끼워 3-step + 보상 사슬을 확인. 남은 것:
-- **4c — orchestration 대조**: 같은 흐름을 중앙 조정자(orchestrator)로 재구현해 choreography와 트레이드오프 비교.
-- **4d — 멱등성(idempotency)**: at-least-once 중복 소비로 재고가 두 번 깎이는 걸 막는다(처리한 이벤트 ID 기록).
-- **4e — Outbox 패턴**: "DB 저장 + 이벤트 발행"이 한 트랜잭션이 아니라서 생기는 발행 원자성 문제를 outbox 테이블 + relay로 해결.
+4c로 choreography ↔ orchestration 대조까지 확인. 남은 것:
+- **4d — 멱등성(idempotency)**: at-least-once 중복 소비로 재고가 두 번 깎이거나 결제가 두 번 되는 걸 막는다(처리한 이벤트/주문 ID 기록).
+- **4e — Outbox 패턴**: "DB 저장 + 이벤트 발행"이 한 트랜잭션이 아니라서 생기는 발행 원자성 문제(dual-write)를 outbox 테이블 + relay로 해결.
