@@ -4,8 +4,12 @@ import com.commerce.order.domain.Order;
 import com.commerce.order.domain.OrderStatus;
 import com.commerce.order.messaging.command.DeductStockCommand;
 import com.commerce.order.messaging.command.ProcessPaymentCommand;
+import com.commerce.order.messaging.command.RefundPaymentCommand;
 import com.commerce.order.messaging.reply.PaymentProcessedReply;
+import com.commerce.order.messaging.reply.StockProcessedReply;
 import com.commerce.order.repository.OrderRepository;
+
+import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -98,6 +102,42 @@ class OrderSagaOrchestratorTest {
 
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
             then(commandPublisher).should(never()).sendDeductStock(any());
+        }
+    }
+
+    @Nested
+    @DisplayName("onStockReply")
+    class OnStockReply {
+
+        @Test
+        @DisplayName("성공 - 재고 차감 성공 응답 → 스냅샷 적용 후 주문 확정(CONFIRMED), total 재계산")
+        void deducted_confirmsOrder() {
+            Order order = Order.create(1L);
+            order.addItem(100L, 2, 25000L);   
+            given(orderRepository.findById(1L)).willReturn(Optional.of(order));
+
+            orchestrator.onStockReply(new StockProcessedReply(1L, StockProcessedReply.Result.DEDUCTED,
+                    List.of(new StockProcessedReply.Item(100L, "키보드", 30000L)), null));
+
+            assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
+            assertThat(order.getTotalAmount()).isEqualTo(60000L);
+        }
+
+        @Test
+        @DisplayName("성공 - 재고 차감 실패 응답 → 환불 명령 발행 + 주문 취소(CANCELLED)")
+        void failed_refundsAndCancels() {
+            Order order = Order.create(1L);
+            order.addItem(100L, 2, 30000L);
+            ReflectionTestUtils.setField(order, "id", 2L);
+            given(orderRepository.findById(2L)).willReturn(Optional.of(order));
+
+            orchestrator.onStockReply(new StockProcessedReply(2L, StockProcessedReply.Result.FAILED,
+                    List.of(), "OUT_OF_STOCK"));
+
+            ArgumentCaptor<RefundPaymentCommand> captor = ArgumentCaptor.forClass(RefundPaymentCommand.class);
+            then(commandPublisher).should().sendRefundPayment(captor.capture());
+            assertThat(captor.getValue().orderId()).isEqualTo(2L);
+            assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
         }
     }
 }
