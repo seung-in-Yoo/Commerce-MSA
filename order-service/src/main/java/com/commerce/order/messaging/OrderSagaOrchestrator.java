@@ -31,7 +31,7 @@ public class OrderSagaOrchestrator {
     public void start(Order order) {
         log.info("[order] 사가 시작 -> 결제 명령 결정 orderId={}, amount={}",
                 order.getId(), order.getTotalAmount());
-        commandPublisher.sendProcessPayment(new ProcessPaymentCommand(order.getId(), order.getTotalAmount()));
+        commandPublisher.sendProcessPayment(ProcessPaymentCommand.create(order.getId(), order.getTotalAmount()));
     }
 
     // 결제 응답 수신 -> 다음 단계 결정
