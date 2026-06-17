@@ -9,12 +9,13 @@
 1. ✅ 서비스 1개 + DB 1개 — Spring Boot를 compose로 띄우기 (워밍업)
 2. ✅ 서비스 2개 + DB 2개, REST 동기 호출 — "남의 DB JOIN 못 함", "쟤 죽으면 나도 죽음" 체감
 3. ✅ 동기 호출을 Kafka 이벤트로 전환 (3a 발행/수신 추가 → 3b 동기 제거, 완전 비동기)
-4. **[현재] Saga(choreography vs orchestration), Outbox, eventual consistency**
+4. ✅ **Saga(choreography vs orchestration), Outbox, eventual consistency**
    - ✅ 4a choreography 보상 (order↔product)
    - ✅ 4b payment 추가 → 주문→결제→재고 **3-step Saga + 보상 사슬** (choreography)
    - ✅ 4c orchestration 대조 — 중앙 오케스트레이터 + command/reply
-   - ⬜ 4d 멱등성 · 4e Outbox
-5. ⬜ API Gateway, 분산 추적, Circuit Breaker(Resilience4j)
+   - ✅ 4d 멱등성 — inbox로 중복 소비 차단 (at-least-once 흡수)
+   - ✅ 4e Outbox — 저장과 발행의 원자성 (dual-write 해소)
+5. **[다음] API Gateway, 분산 추적, Circuit Breaker(Resilience4j)**
 
 ## 지키는 습관 (12-factor / k8s 대비)
 - 설정(호스트명/포트/DSN)은 전부 환경변수로 외부화
@@ -36,7 +37,7 @@
 
 컨테이너 안에서는 브로커를 `kafka:9092`로, 맥에서 IDE로 직접 띄울 땐 `localhost:9094`로 접속한다.
 
-## 아키텍처 — orchestration Saga (현재, 4c)
+## 아키텍처 — orchestration Saga + 신뢰성 메시징 (4c~4e)
 
 서비스 간은 Kafka로 잇되, **중앙 오케스트레이터(order 내장 `OrderSagaOrchestrator`)가 흐름을 구성**한다.
 토픽은 event가 아니라 **명령(command)/응답(reply)** 채널이다. 주문 1건이 오케스트레이터의 결정에 따라 단계별로 흐른다:
@@ -55,7 +56,10 @@ order(오케스트레이터)  주문(PENDING) → 사가 시작
 - **payment/product는 "명령 받아 처리 → 응답"만** 한다. "다음에 뭘 할지"는 전부 오케스트레이터가 결정 → 서비스끼리 서로를 모른다(4b choreography에선 각 서비스가 다음 단계를 암묵적으로 알아야 했음).
 - 결제가 재고보다 **먼저**라, 주문 생성 시 클라가 보낸 **예상 단가**로 결제 금액(`amount`)을 만든다. 상품의 **진짜 이름/단가는 재고 차감 후 product가 채운다**(order는 상품을 JOIN하지 않는다).
 - order·payment는 타입이 다른 토픽을 **둘씩** 구독하므로 타입별 컨슈머 팩토리(`KafkaConsumerConfig`)로 역직렬화를 분리한다.
-- choreography(4b) ↔ orchestration(4c) 대조는 [LEARNING_JOURNEY.md](./LEARNING_JOURNEY.md) Step 4b·4c 참고.
+- **신뢰성 메시징 — Kafka는 at-least-once다.** 이를 두 패턴으로 받친다:
+  - **멱등 소비 / inbox (4d)**: 메시지마다 `messageId`(UUID)를 싣고, 처리한 id를 각 서비스 DB의 `processed_messages`에 PK로 기록한다. 재배달되면 `existsById`로 걸러 **부수효과를 한 번만** 낸다(이중 결제/차감/환불·연쇄 트리거 차단). 부수효과와 기록은 같은 트랜잭션.
+  - **Outbox (4e)**: order는 명령을 Kafka로 직접 쏘지 않고 `outbox_messages` 테이블에 **주문 상태 변경과 같은 트랜잭션으로 적재**한다(`SagaCommandPublisher`). 별도 릴레이(`OutboxRelay`, `@Scheduled`)가 PENDING 행을 읽어 발행 후 SENT로 마킹 → **저장과 발행이 원자적**이라 "DB는 커밋됐는데 발행 직전 죽음(발행 누락)"·"발행은 됐는데 DB 롤백(유령 결제)" 둘 다 막는다. 릴레이 재발행(at-least-once)은 위 inbox가 흡수 → 둘이 짝.
+- choreography(4b) ↔ orchestration(4c) 대조, 멱등(4d)·outbox(4e) 관찰 기록은 [LEARNING_JOURNEY.md](./LEARNING_JOURNEY.md) 참고.
 
 ## 실행 방법
 
@@ -140,6 +144,12 @@ docker compose start product-service
 - **재고 부족 / 없는 상품**: product가 `PRODUCT_xxx`로 실패 → 보상으로 주문 취소(+결제 환불).
 - **결제 한도 조정**: `.env`의 `PAYMENT_APPROVAL_LIMIT`를 낮춰 결제 거절(보상①)을 쉽게 유도.
 - **consumer offset/lag**: `kafka-consumer-groups --group order-service --describe`로 어디까지 읽었나 확인.
+- **outbox 흐름 (4e)**: 주문 직후 order-db의 outbox를 보면 PENDING → (릴레이 1초 주기) → SENT로 넘어간다.
+  ```bash
+  docker compose exec order-db mysql -uroot -prootpw orderdb \
+    -e "SELECT topic, status, sent_at FROM outbox_messages ORDER BY created_at;"
+  ```
+- **멱등 소비 (4d)**: 처리된 메시지 id는 각 서비스 DB의 `processed_messages`에 남는다. 같은 메시지를 재produce하면 `중복 메시지 스킵` 로그와 함께 부수효과가 안 늘어난다
 
 ### 정리
 ```bash

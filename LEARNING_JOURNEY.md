@@ -537,6 +537,87 @@ GET /orders/3 → `CANCELLED`, 결제 `REFUNDED`, 재고 98 그대로. **오케�
 
 ---
 
+## Step 4e — Outbox 패턴 (저장과 발행의 원자성 / dual-write 해소)
+
+### 직전의 고통
+4d로 "중복 소비"는 막았지만, **메시지를 Kafka로 보내는 일 자체가 비즈니스 트랜잭션 밖**에 있었다. `createOrder`를 보면:
+
+```java
+@Transactional
+public OrderResponse createOrder(...) {
+    orderRepository.save(order);   // 1. 로컬 DB (커밋은 메서드 끝나야)
+    orchestrator.start(saved);     // 2. kafkaTemplate.send — @Transactional 무시하고 즉시 브로커로
+}
+```
+
+`save`(DB)와 `send`(Kafka)는 **서로 다른 두 시스템에 쓰는 행위(dual-write)**인데, Kafka는 `@Transactional`에 참여하지 않으므로 `send`는 커밋 전에 그 자리에서 바로 나간다. 그래서 둘이 깨질 수 있다:
+- **send 성공 → 직후 DB 롤백**: 결제 명령은 Kafka에 떴는데 주문 row는 없다 → payment가 유령 주문을 결제(**유령 결제**). TS-3에서 본 그 현상의 근본 원인.
+- **DB 커밋 → send 실패(브로커 다운)**: 주문은 PENDING으로 저장됐는데 명령이 안 나가 **사가가 시작도 못 함(발행 누락)**.
+
+이 구멍은 `createOrder`뿐 아니라 `onPaymentReply`(→재고 명령), `onStockReply`(→환불 명령) 등 **모든 발행 지점**에 똑같이 있었다(전부 `SagaCommandPublisher`를 거친다).
+
+### 핵심 개념 — Outbox = "발행"을 "같은 DB로의 INSERT"로 바꾼다
+- 두 시스템(DB+Kafka)을 하나의 트랜잭션으로 묶는 건 불가능하다. 그래서 발상을 바꾼다: **Kafka로 바로 쏘는 대신, "이걸 나중에 발행하라"는 행을 *같은 DB*의 outbox 테이블에 적는다.**
+- 주문 row 변경과 outbox INSERT는 **같은 로컬 트랜잭션** → 커밋되면 둘 다, 롤백되면 둘 다. 유령 결제도 발행 누락도 원천 차단.
+- 실제 Kafka 발행은 **별도 릴레이(poller)**가 outbox의 PENDING 행을 주기적으로 읽어 발행하고 SENT로 마킹한다.
+- **at-least-once는 사라지지 않고 오히려 릴레이가 만든다**: 발행 성공 후 markSent 커밋 전에 죽으면 다음 폴링에 또 보낸다. 이 중복은 **4d inbox(messageId)가 흡수** → **outbox(발행 보장) + inbox(중복 흡수)가 신뢰성 메시징의 짝**이고, 둘을 합쳐야 "정확히 한 번 효과"가 완성된다.
+
+### 설계 결정
+- **order 한 서비스에만 먼저 적용.** order의 세 발행(`createOrder`/`onPaymentReply`/`onStockReply`)이 전부 `SagaCommandPublisher` 한 곳을 거치므로, 이 클래스만 outbox로 바꾸면 세 발행이 한 번에 트랜잭셔널해짐 
+- **payload는 직렬화된 JSON 문자열로 저장.** 릴레이는 이 문자열을 **`StringSerializer` 전용 `KafkaTemplate`**로 "있는 그대로" 발행한다. 기존 자동구성 템플릿은 `JsonSerializer`라 JSON 문자열을 *또* 인코딩해(따옴표로 감싸) 컨슈머가 못 읽는다. producer가 `add.type.headers=false`라 컨슈머는 타입 헤더 없이 fixed type으로 파싱 → 발행 바이트가 직접발행 시절과 동일.
+- **동기 발행(`.get()`) 후 markSent.** 브로커 도착을 확인한 뒤에만 SENT로 마킹한다. 실패하면 예외 → 트랜잭션 롤백 → 그 행은 PENDING으로 남아 다음 폴링에서 재시도("보냈다고 거짓 마킹 후 유실"을 방지).
+- **markSent는 dirty checking**으로 같은 `@Transactional` 안에서 UPDATE된다(별도 save 호출 없음).
+- **폴링 방식(`@Scheduled(fixedDelay=1s)`).** 빈 폴링도 매번 DB를 때리는 비용이 있지만, CDC(Debezium 등)는 학습 범위 밖이라 폴링이 정답.
+
+### 무엇을 만들었나 
+- **1 · outbox 테이블**: `OutboxMessage`(`id` UUID PK len36 + `topic` + `message_key` + `payload` TEXT + `status` PENDING/SENT + `created_at`/`sent_at`) + `OutboxStatus` enum + `OutboxMessageRepository`(`findTop100ByStatusOrderByCreatedAtAsc`). 정적 팩토리 `create`, 도메인 메서드 `markSent`
+- **2 · 발행 → 적재 전환**: `SagaCommandPublisher`에서 `KafkaTemplate` 의존 제거 → `OutboxMessageRepository` + `ObjectMapper`. 세 `send*`가 command를 JSON 직렬화해 outbox에 INSERT(호출부의 `@Transactional`에 참여). 메서드 시그니처 유지 → 오케스트레이터·테스트 무변경
+- **3 · 릴레이**: `OutboxRelay`(`@Scheduled`, PENDING 묶음 읽어 동기 발행 후 `markSent`) + `KafkaProducerConfig`(`outboxKafkaTemplate`, String 직렬화) + `OrderApplication`에 `@EnableScheduling`
+- **4 · 통합 관찰**: docker로 정상 흐름 + 강제 롤백 두 시나리오 확인
+
+### 직접 관찰한 것
+**환경**: `down -v`로 초기화 후 전체 기동. 상품 등록(키보드 30000/재고 100, productId=1).
+
+#### A. 정상 주문 → outbox 경유 CONFIRMED (productId=1, 2개, amount 6만)
+주문 생성 응답은 `status:"PENDING"`(사가 비동기 진행 중), 5초 뒤 조회 → `CONFIRMED`. outbox 테이블:
+```
++--------------------------------------+------------------+--------+----------------------------+
+| id                                   | topic            | status | sent_at                    |
++--------------------------------------+------------------+--------+----------------------------+
+| d18f2db3-…-d031554244b0              | payment-commands | SENT   | 2026-06-17 18:03:21.967943 |
+| b3ab6dc9-…-07766a16a36f              | stock-commands   | SENT   | 2026-06-17 18:03:22.988270 |
++--------------------------------------+------------------+--------+----------------------------+
+```
+→ 두 명령이 outbox에 적재됐다가 릴레이가 발행하며 **모두 `SENT`로 전환**(`sent_at` 채워짐). 재고 100→98. 발행이 더 이상 비즈니스 코드에서 직접 안 나가고 **DB(outbox) → 릴레이 → Kafka** 경로로 흐른다.
+
+#### B. 강제 롤백 → 유령 결제 없음 (dual-write 해소의 결정적 증거)
+`createOrder`에 발행(적재) 직후 강제 예외(`throw new RuntimeException(...)`)를 임시로 넣고 order-service만 재빌드 → 새 주문 시도(orderId=2):
+
+```
+[order] 사가 시작 -> 결제 명령 결정 orderId=2, amount=60000
+[order] ProcessPayment 명령 outbox 적재 -> topic=payment-commands, orderId=2, amount=60000
+ERROR ... java.lang.RuntimeException: [임시] dual-write 관찰용 강제 롤백
+    at com.commerce.order.service.OrderService.createOrder(OrderService.java:35)
+```
+요청은 500. 롤백 후 상태:
+
+| 확인 | 롤백 전 | 롤백 후 |
+|---|---|---|
+| `orders` | id=1 (CONFIRMED) | **id=1만** (orderId=2 row 없음) |
+| `COUNT(outbox_messages)` | 2 | **2** (orderId=2 적재가 무효화) |
+| `payments` | order_id=1 (APPROVED) | **order_id=1만** (유령 결제 없음) |
+
+**결정적 포인트**: 로그상 "ProcessPayment 명령 outbox 적재" INFO는 찍혔지만 `outbox_cnt`는 안 늘었다. 로그는 트랜잭션 커밋 *전* 메모리 상태고, INSERT는 롤백으로 무효화됐다 — **"로그상 적재됐어도 커밋 안 되면 없던 일."** 예전 직접발행이었다면 저 시점에 이미 `send`가 Kafka로 나가 payment가 orderId=2를 결제했을 것이고, 주문은 롤백돼 없는데 결제만 떠도는 불일치가 남았을 것이다. outbox가 해당 단점을 보완 
+
+### 배운 것
+- **dual-write는 "두 시스템을 한 트랜잭션으로 못 묶어서" 생기는 구조적 문제다.** outbox의 본질은 "발행"이라는 외부 행위를 "같은 DB로의 INSERT"라는 로컬 행위로 바꿔 트랜잭션 안으로 끌어들이는 것
+- **outbox는 at-least-once를 없애지 않는다 — 만든다.** 릴레이의 발행/마킹 사이 틈 때문에 재발행이 생긴다. 그래서 4d inbox 없이는 outbox만으로 불완전하다. 둘은 짝(저장·발행의 원자성 ↔ 중복 흡수)
+- **커밋되지 않은 부수효과는 존재하지 않는다.** 관찰 B에서 로그는 찍혔지만 행은 없었다 — 트랜잭션 원자성을 눈으로 본 사례. "코드가 실행됐다 ≠ 영속됐다"
+- **직렬화 형식이 발행 경로를 바꾼다.** 이미 JSON인 payload를 JsonSerializer로 또 감싸면 깨진다 → 릴레이엔 StringSerializer 전용 템플릿이 필요. "무엇을 직렬화된 상태로 저장하느냐"가 발행단 설계에 직결
+- **신뢰성에는 공짜가 없다.** outbox는 정합성을 사지만 폴링 비용(빈 SELECT 반복)과 발행 지연(최대 폴링 주기)을 낸다. 더 줄이려면 CDC로 가야 하고, 그건 또 다른 인프라 부담
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -548,7 +629,8 @@ GET /orders/3 → `CANCELLED`, 결제 `REFUNDED`, 재고 98 그대로. **오케�
 
 ---
 
-## 다음 — Step 4e 예고
+## 다음 — Step 5 예고
 
-4d로 멱등 소비(inbox)까지 확인 — 같은 메시지를 재배달해도 결제·차감·환불·재고명령이 한 번만 일어난다. 남은 것:
-- **4e — Outbox 패턴**: inbox는 "중복 소비"를 막지만, 부수효과 저장과 **메시지 발행이 여전히 별개 트랜잭션(dual-write)** 이라 "DB는 커밋됐는데 발행 직전 죽음 = 사가 멈춤(발행 누락)"은 못 막는다. outbox 테이블에 발행할 메시지를 같은 트랜잭션으로 적재 + relay가 비동기 발행해 **저장과 발행을 원자적으로** 만든다.
+Step 4(Saga)는 4a~4e로 마무리됐다. 보상 루프(4a) → 결제 추가 3-step choreography(4b) → orchestration 대조(4c) → 멱등 소비(4d) → outbox(4e)까지, 분산 트랜잭션의 정합성을 이벤트/사가/inbox/outbox로 닫았다. 남은 것:
+- **Step 5 — API Gateway · 분산 추적 · Circuit Breaker(Resilience4j)**: 지금은 서비스마다 포트가 흩어져 있고(8080/8081/8082), 한 주문이 order→payment→product를 거치는 흐름을 로그를 `grep`으로 이어 붙여 본다. 게이트웨이로 진입점을 모으고, 분산 추적(trace id)으로 한 요청의 전체 경로를 한 줄로 잇고, Circuit Breaker로 의존 서비스 장애를 격리한다.
+- **(보류) outbox 확장**: payment·product의 reply 발행에 남은 dual-write. 같은 패턴이라 학습 가치가 낮아 미뤘다 — 운영 관점이 필요해지면 그때.
