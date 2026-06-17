@@ -48,7 +48,7 @@ public class OrderSagaOrchestrator {
                 List<DeductStockCommand.Item> items = order.getItems().stream()
                         .map(item -> new DeductStockCommand.Item(item.getProductId(), item.getQuantity()))
                         .toList();
-                commandPublisher.sendDeductStock(new DeductStockCommand(order.getId(), items));
+                commandPublisher.sendDeductStock(DeductStockCommand.create(order.getId(), items));
                 log.info("[order] 결제 승인 -> 재고 차감 명령 결정 orderId={}", order.getId());
             }
             case FAILED -> {
