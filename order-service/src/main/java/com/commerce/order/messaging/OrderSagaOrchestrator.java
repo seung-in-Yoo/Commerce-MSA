@@ -7,6 +7,8 @@ import com.commerce.order.global.exception.ApplicationException;
 import com.commerce.order.messaging.command.DeductStockCommand;
 import com.commerce.order.messaging.command.ProcessPaymentCommand;
 import com.commerce.order.messaging.command.RefundPaymentCommand;
+import com.commerce.order.messaging.inbox.ProcessedMessage;
+import com.commerce.order.messaging.inbox.ProcessedMessageRepository;
 import com.commerce.order.messaging.reply.PaymentProcessedReply;
 import com.commerce.order.messaging.reply.StockProcessedReply;
 import com.commerce.order.repository.OrderRepository;
@@ -26,6 +28,7 @@ public class OrderSagaOrchestrator {
 
     private final SagaCommandPublisher commandPublisher;
     private final OrderRepository orderRepository;
+    private final ProcessedMessageRepository processedMessageRepository;
 
     // 사가 시작 -> 생성된 주문(PENDING)의 금액으로 결제를 명령
     public void start(Order order) {
@@ -40,7 +43,15 @@ public class OrderSagaOrchestrator {
     @KafkaListener(topics = "payment-replies", containerFactory = "paymentProcessedReplyListenerFactory")
     @Transactional
     public void onPaymentReply(PaymentProcessedReply reply) {
-        log.info("[order] PaymentProcessed 응답 수신 <- orderId={}, result={}", reply.orderId(), reply.result());
+        log.info("[order] PaymentProcessed 응답 수신 <- messageId={}, orderId={}, result={}",
+                reply.messageId(), reply.orderId(), reply.result());
+
+        // 멱등 가드: 이미 처리한 응답이면 스킵 -> 재고 차감 명령 이중 발행 방지
+        if (processedMessageRepository.existsById(reply.messageId())) {
+            log.info("[order] 중복 응답 스킵(이미 처리됨) -> messageId={}, orderId={}",
+                    reply.messageId(), reply.orderId());
+            return;
+        }
         Order order = findOrder(reply.orderId());
 
         switch (reply.result()) {
@@ -57,6 +68,9 @@ public class OrderSagaOrchestrator {
                         order.getId(), reply.reasonCode());
             }
         }
+
+        // 처리 사실을 주문 상태 변경과 같은 트랜잭션에서 기록 -> 다음 재배달은 위 가드에서 걸린다
+        processedMessageRepository.save(ProcessedMessage.of(reply.messageId()));
     }
 
     // 재고 응답 수신 -> 사가의 마지막 단계 결정
@@ -65,7 +79,15 @@ public class OrderSagaOrchestrator {
     @KafkaListener(topics = "stock-replies", containerFactory = "stockProcessedReplyListenerFactory")
     @Transactional
     public void onStockReply(StockProcessedReply reply) {
-        log.info("[order] StockProcessed 응답 수신 <- orderId={}, result={}", reply.orderId(), reply.result());
+        log.info("[order] StockProcessed 응답 수신 <- messageId={}, orderId={}, result={}",
+                reply.messageId(), reply.orderId(), reply.result());
+
+        // 멱등 가드: 이미 처리한 응답이면 스킵 -> 환불 명령/주문 확정 이중 처리 방지
+        if (processedMessageRepository.existsById(reply.messageId())) {
+            log.info("[order] 중복 응답 스킵(이미 처리됨) -> messageId={}, orderId={}",
+                    reply.messageId(), reply.orderId());
+            return;
+        }
         Order order = findOrder(reply.orderId());
 
         switch (reply.result()) {
@@ -84,6 +106,9 @@ public class OrderSagaOrchestrator {
                         order.getId(), reply.reasonCode());
             }
         }
+
+        // 처리 사실을 주문 상태 변경과 같은 트랜잭션에서 기록
+        processedMessageRepository.save(ProcessedMessage.of(reply.messageId()));
     }
 
     private Order findOrder(Long orderId) {
