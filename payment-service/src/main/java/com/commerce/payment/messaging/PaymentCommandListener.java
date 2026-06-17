@@ -3,12 +3,15 @@ package com.commerce.payment.messaging;
 import com.commerce.payment.domain.PaymentStatus;
 import com.commerce.payment.dto.PaymentResponse;
 import com.commerce.payment.messaging.command.ProcessPaymentCommand;
+import com.commerce.payment.messaging.inbox.ProcessedMessage;
+import com.commerce.payment.messaging.inbox.ProcessedMessageRepository;
 import com.commerce.payment.messaging.reply.PaymentProcessedReply;
 import com.commerce.payment.service.PaymentService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 // payment-commands 토픽 구독자
 // 오케스트레이터의 ProcessPaymentCommand를 받아 결제를 시도하고, 결과를 payment-replies로 응답
@@ -19,14 +22,25 @@ public class PaymentCommandListener {
 
     private final PaymentService paymentService;
     private final PaymentReplyPublisher paymentReplyPublisher;
+    private final ProcessedMessageRepository processedMessageRepository;
 
     // payment가 두 command 타입(결제/환불)을 구독하므로 타입별 전용 팩토리 지정
+    // 결제 저장과 inbox 기록(ProcessedMessage)을 한 트랜잭션으로 묶음
     @KafkaListener(topics = "payment-commands", containerFactory = "processPaymentCommandListenerFactory")
+    @Transactional
     public void onProcessPayment(ProcessPaymentCommand command) {
-        log.info("[payment] ProcessPayment 명령 수신 <- orderId={}, amount={}",
-                command.orderId(), command.amount());
+        log.info("[payment] ProcessPayment 명령 수신 <- messageId={}, orderId={}, amount={}",
+                command.messageId(), command.orderId(), command.amount());
+
+        // 멱등 가드 -> 이미 처리한 messageId면 결제하지 않고 스킵
+        if (processedMessageRepository.existsById(command.messageId())) {
+            log.info("[payment] 중복 메시지 스킵(이미 처리됨) -> messageId={}, orderId={}",
+                    command.messageId(), command.orderId());
+            return;
+        }
 
         PaymentResponse payment = paymentService.pay(command.orderId(), command.amount());
+        processedMessageRepository.save(ProcessedMessage.of(command.messageId()));
 
         if (payment.getStatus() == PaymentStatus.APPROVED) {
             paymentReplyPublisher.publishPaymentProcessed(

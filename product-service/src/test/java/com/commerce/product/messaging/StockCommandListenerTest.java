@@ -1,12 +1,10 @@
 package com.commerce.product.messaging;
 
-import com.commerce.product.dto.StockDeductRequest;
 import com.commerce.product.dto.StockDeductResponse;
 import com.commerce.product.exception.ProductErrorCase;
 import com.commerce.product.global.exception.ApplicationException;
 import com.commerce.product.messaging.command.DeductStockCommand;
 import com.commerce.product.messaging.reply.StockProcessedReply;
-import com.commerce.product.service.ProductService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -19,12 +17,14 @@ import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.mockito.Mockito.never;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -35,13 +35,13 @@ class StockCommandListenerTest {
     private StockCommandListener stockCommandListener;
 
     @Mock
-    private ProductService productService;
+    private StockCommandHandler stockCommandHandler;
 
     @Mock
     private StockReplyPublisher stockReplyPublisher;
 
     private static DeductStockCommand defaultCommand() {
-        return new DeductStockCommand(1L, List.of(
+        return new DeductStockCommand("msg-1", 1L, List.of(
                 new DeductStockCommand.Item(1L, 2),
                 new DeductStockCommand.Item(3L, 1)));
     }
@@ -51,22 +51,17 @@ class StockCommandListenerTest {
     class OnDeductStock {
 
         @Test
-        @DisplayName("성공 - 차감 후 StockProcessed(DEDUCTED, 이름/단가 포함) 응답 발행")
+        @DisplayName("성공 - 차감되면 StockProcessed(DEDUCTED, 이름/단가 포함) 응답 발행")
         void deducts_publishesDeducted() {
-            given(productService.deductStock(any())).willReturn(StockDeductResponse.builder()
+            given(stockCommandHandler.deductAndRecord(any())).willReturn(Optional.of(StockDeductResponse.builder()
                     .items(List.of(
                             StockDeductResponse.Item.builder()
                                     .productId(1L).productName("키보드").unitPrice(30000L).quantity(2).build(),
                             StockDeductResponse.Item.builder()
                                     .productId(3L).productName("컴퓨터").unitPrice(600000L).quantity(1).build()))
-                    .build());
+                    .build()));
 
             stockCommandListener.onDeductStock(defaultCommand());
-
-            ArgumentCaptor<StockDeductRequest> reqCaptor = ArgumentCaptor.forClass(StockDeductRequest.class);
-            then(productService).should().deductStock(reqCaptor.capture());
-            assertThat(reqCaptor.getValue().items())
-                    .extracting(StockDeductRequest.Line::productId).containsExactly(1L, 3L);
 
             ArgumentCaptor<StockProcessedReply> replyCaptor = ArgumentCaptor.forClass(StockProcessedReply.class);
             then(stockReplyPublisher).should().publishStockProcessed(replyCaptor.capture());
@@ -80,7 +75,7 @@ class StockCommandListenerTest {
         @Test
         @DisplayName("실패 - 차감이 OUT_OF_STOCK을 던지면 전파 대신 StockProcessed(FAILED) 응답 발행")
         void deductFails_publishesFailed() {
-            given(productService.deductStock(any()))
+            given(stockCommandHandler.deductAndRecord(any()))
                     .willThrow(ApplicationException.from(ProductErrorCase.OUT_OF_STOCK));
 
             assertThatCode(() -> stockCommandListener.onDeductStock(defaultCommand()))
@@ -92,6 +87,16 @@ class StockCommandListenerTest {
             assertThat(reply.result()).isEqualTo(StockProcessedReply.Result.FAILED);
             assertThat(reply.reasonCode()).isEqualTo(ProductErrorCase.OUT_OF_STOCK.getCode());
             assertThat(reply.items()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("멱등 - 이미 처리한 messageId 재배달(handler가 empty) → 응답 발행 스킵")
+        void duplicate_skipped() {
+            given(stockCommandHandler.deductAndRecord(any())).willReturn(Optional.empty());
+
+            stockCommandListener.onDeductStock(defaultCommand());
+
+            then(stockReplyPublisher).should(never()).publishStockProcessed(any());
         }
     }
 }

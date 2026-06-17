@@ -15,7 +15,8 @@
 | 4a | 비동기 불일치(주문은 됐는데 재고 결과를 order가 모름) | **choreography Saga** — product가 결과를 역방향 이벤트로, order가 받아 `CONFIRMED`/`CANCELLED`(+ 이름/가격 채움) | 단계가 늘면 보상 사슬·중복 소비·발행 원자성 문제 → 4b~4e |
 | 4b | 보상이 "주문 취소" 하나뿐 — 보상 사슬·스타일 대조가 안 보임 | **payment 추가 3-step Saga** — 주문→결제→재고, 재고 실패 시 **결제 환불 + 주문 취소** 보상 사슬 | 흐름이 5개 리스너에 흩어져 추적이 어려움 → 4c |
 | 4c | choreography는 "다음에 뭘 할지"가 각 서비스에 흩어져 전체 흐름이 코드 어디에도 없음 | **orchestration** — 중앙 오케스트레이터가 command/reply로 전 단계를 지휘, 흐름이 한 클래스로 모임 | 흐름은 모였으나 멱등성 X·발행 원자성 X는 그대로 → 4d~4e |
-| 4d~4e (예정) | (4c에서 이어짐) | 멱등성 / Outbox | … |
+| 4d | 4c에서 흐름은 한 곳에 모였지만 Kafka at-least-once라 같은 명령/응답이 재배달되면 결제·재고차감·환불·재고명령이 **두 번** 일어남 | **멱등 소비(inbox)** — `messageId`를 PK로 `processed_messages`에 기록하고 **부수효과와 같은 트랜잭션**으로 묶어 재배달돼도 한 번만 처리 | DB저장+발행이 여전히 비원자(dual-write) → 4e |
+| 4e (예정) | (4d에서 이어짐) | Outbox | … |
 
 ---
 
@@ -455,6 +456,87 @@ GET /orders/3 → `CANCELLED`, 결제 `REFUNDED`, 재고 98 그대로. **오케�
 
 ---
 
+## Step 4d — 멱등 소비 (inbox / 중복 배달 차단)
+
+### 직전의 고통
+4c로 흐름은 한 클래스에 모였지만, **Kafka는 at-least-once**다. 네트워크 끊김·컨슈머 리밸런싱·offset 커밋 실패 등으로 **같은 메시지가 두 번 배달**될 수 있다. 그런데 4c의 리스너들은 받은 메시지를 무조건 처리한다 → 결제 명령 재배달 = **이중 결제**, 재고 명령 재배달 = **이중 차감**, 환불 명령 재배달 = **이중 환불**, 그리고 결제 응답 재배달 = **재고 차감 명령이 또 발행되는 연쇄 이중 트리거**. "정확히 한 번"을 브로커가 보장 못 하니, **소비하는 쪽이 멱등**해야 한다.
+
+### 핵심 개념 — 멱등 소비 = 메시지 단위 식별자 + inbox
+- **멱등(idempotent)**: 같은 연산을 여러 번 해도 결과가 한 번 한 것과 같다. 우리가 원하는 건 "같은 메시지를 N번 받아도 부수효과는 1번".
+- **방법**: 메시지마다 고유 `messageId`(UUID)를 부여하고, 처리한 messageId를 **inbox 테이블(`processed_messages`)에 PK로 기록**한다. 메시지를 받으면 먼저 `existsById(messageId)`로 검사 → 이미 있으면 **즉시 return(부수효과 0)**, 없으면 처리하고 기록.
+- **결정적 포인트 — 부수효과와 inbox 기록을 같은 트랜잭션으로 묶는다.** 결제 저장과 `ProcessedMessage` 저장이 한 `@Transactional` 안에 있어야, "처리는 했는데 기록 직전에 죽어서 다음 재배달 때 또 처리"되는 틈이 없다. (둘 중 하나만 커밋되면 멱등이 깨진다.)
+- **멱등 키는 orderId가 아니라 messageId 단위.** 같은 주문이라도 "다른 메시지"면 다른 일이므로 막으면 안 된다. 막는 기준은 *메시지 1건의 정체성*이다(→ 아래 반증).
+
+### 설계 결정
+- **inbox는 서비스마다 자기 DB에** (`order-db`/`product-db`/`payment-db` 각각 `processed_messages`). 멱등은 "이 컨슈머가 이 메시지를 처리했나"의 로컬 문제 → DB per service 원칙 유지.
+- **모든 command/reply record에 `messageId` 필드 추가**(발행 시 `create(...)`에서 `UUID.randomUUID()` 부여). 멱등 키를 메시지 페이로드에 실어 보낸다.
+- **가드를 4곳에 배치**(= 부수효과가 있는 컨슈머 전부):
+  | 토픽 | 가드 위치 | 막는 것 |
+  |---|---|---|
+  | `payment-commands` | `PaymentCommandListener` | 이중 결제 |
+  | `stock-commands` | `StockCommandHandler` | 이중 재고 차감 |
+  | `payment-replies` | `OrderSagaOrchestrator.onPaymentReply` | 재고 명령 이중 발행(연쇄 트리거) |
+  | `payment-refund-commands` | `RefundCommandListener` | 이중 환불 |
+- **재고 차감만 listener에서 트랜잭션 핸들러(`StockCommandHandler`)로 분리**: "차감+inbox 기록"은 한 트랜잭션이어야 하지만, **재고 부족(FAILED) 응답 발행은 트랜잭션 밖**에서 해야 한다(롤백돼야 할 차감과 분리). 그래서 핸들러는 `Optional`을 돌려주고(중복=`empty`), listener가 그 결과로 응답을 발행/스킵한다.
+- **실패는 inbox에 기록하지 않는다**(의도). 재고 부족은 영속 효과가 없으니(롤백), messageId를 안 남긴다 → 재배달돼도 "다시 실패"할 뿐 이중 부수효과가 없다. inbox는 *성공한 부수효과*만 보호하면 된다.
+
+### 무엇을 만들었나 (조각별)
+- **1 · 멱등 키**: 5개 command/reply record에 `messageId` 추가 + 정적 팩토리에서 UUID 발급
+- **2 · inbox 엔티티**: 각 서비스에 `ProcessedMessage`(`message_id` PK length 36 + `processed_at`) + `ProcessedMessageRepository`
+- **3 · 결제 가드**: `PaymentCommandListener`에 `existsById` 검사 + 결제·기록 한 트랜잭션
+- **4 · 재고 가드**: `StockCommandHandler` 신설(차감+기록 트랜잭션, 중복은 `Optional.empty`), listener는 응답만
+- **5 · reply 가드**: `OrderSagaOrchestrator`의 `onPaymentReply`/`onStockReply`에 검사 + 주문상태변경·기록 한 트랜잭션 → **연쇄 이중 트리거 차단**
+- **6 · 환불 가드**: `RefundCommandListener`에 검사 + 환불·기록 한 트랜잭션
+
+### 직접 관찰한 것
+**테스트 방법**: 정상 주문 1건(orderId=4)을 CONFIRMED까지 흘려 messageId 4개를 로그에서 확보한 뒤, **그 messageId 그대로 다시 produce**해 "이미 처리됨 → 스킵"을 확인
+
+#### 0. 정상 1바퀴 → CONFIRMED (키보드 2개, amount 10만, productId=3 재고 100→98)
+```
+[payment] ProcessPayment 명령 수신 <- messageId=1d848713-…-3b4cb6fce384, orderId=4, amount=100000
+[payment] 결제 승인(APPROVED) -> orderId=4, paymentId=4
+[order]   PaymentProcessed 응답 수신 <- messageId=23dd4191-…-4b93d9e74d0e, orderId=4, result=APPROVED
+[order]   결제 승인 -> 재고 차감 명령 결정 orderId=4
+[product] DeductStock 명령 수신 <- messageId=75ed1921-…-365458a51c10, orderId=4, items=[Item[productId=3, quantity=2]]
+[product] 재고 차감 완료 -> orderId=4
+[order]   StockProcessed 응답 수신 <- messageId=efaac8c0-…-049446667747, orderId=4, result=DEDUCTED
+[order]   재고 차감 성공 -> 주문 확정(CONFIRMED) orderId=4
+```
+→ 메시지별 messageId: **결제명령** `1d848713` / **결제응답** `23dd4191` / **재고명령** `75ed1921` / **재고응답** `efaac8c0`.
+
+#### 1. 이중 결제 차단 — `payment-commands`에 결제명령(messageId 1d848713) 재생
+```
+[payment] ProcessPayment 명령 수신 <- messageId=1d848713-…, orderId=4, amount=100000
+[payment] 중복 메시지 스킵(이미 처리됨) -> messageId=1d848713-…, orderId=4
+```
+`SELECT COUNT(*) FROM payments WHERE order_id=4` → **재생 전 1, 재생 후 1**. `paymentService.pay()` 자체가 호출되지 않음
+
+#### 2. 연쇄 이중 트리거 차단 — `payment-replies`에 결제응답(messageId 23dd4191) 재생
+```
+[order] PaymentProcessed 응답 수신 <- messageId=23dd4191-…, orderId=4, result=APPROVED
+[order] 중복 응답 스킵(이미 처리됨) -> messageId=23dd4191-…, orderId=4
+```
+**결정적 증거**: 스킵 직후 `결제 승인 -> 재고 차감 명령 결정` / `DeductStock 명령 발행` 로그가 **안 뜬다** = 재고 차감 명령이 다시 발행되지 않음. 응답 한 번 중복 → 사가가 한 칸 더 굴러가는 것을 막음 
+
+#### 3. 이중 재고 차감 차단 — `stock-commands`에 재고명령(messageId 75ed1921) 재생
+```
+[product] DeductStock 명령 수신 <- messageId=75ed1921-…, orderId=4, items=[Item[productId=3, quantity=2]]
+[product] 중복 메시지 스킵(이미 처리됨) -> messageId=75ed1921-…, orderId=4
+```
+`SELECT stock_quantity FROM products WHERE id=3` → **재생 전 98, 재생 후 98**. 추가 차감 없음.
+
+> (예정) **반증 테스트** — messageId만 새 값으로 바꿔 같은 결제명령을 쏘면 가드를 통과해 `payments`가 2건이 된다(이중 결제). "멱등은 orderId가 아니라 messageId 단위"임을 역으로 증명. **가드 D(이중 환불)** 는 재고 부족 주문으로 보상(환불)을 발생시킨 뒤 그 환불 messageId를 재생해 확인.
+
+### 배운 것
+- **at-least-once의 책임은 컨슈머로 넘어온다.** 브로커가 "정확히 한 번"을 못 주니, "여러 번 받아도 한 번"을 *소비 쪽이* 만든다. 이게 멱등 소비(inbox 패턴).
+- **멱등의 핵심은 검사 자체가 아니라 "부수효과 + 기록"의 원자성.** 같은 트랜잭션으로 안 묶으면 처리 후/기록 전 죽었을 때 틈이 생긴다. inbox는 "기록도 부수효과의 일부"라는 발상.
+- **멱등 키 = 메시지 1건의 정체성(messageId).** orderId로 막으면 정당한 후속 메시지까지 막힌다. 무엇을 "같은 일"로 볼지가 키 설계.
+- **reply도 멱등 대상이다.** 명령(결제/차감/환불)만 생각하기 쉽지만, 오케스트레이터가 받는 **응답이 중복되면 다음 명령이 이중 발행**된다(연쇄). 부수효과(=다음 명령 발행)가 있는 모든 컨슈머가 가드 대상.
+- **실패는 기록하지 않는 게 맞다.** inbox는 성공한 영속 효과만 보호하면 된다. 실패는 재배달돼도 다시 실패할 뿐이라 이중 효과가 없다 — 무조건 다 기록하는 게 아니라 "되돌릴 수 없는 부수효과"를 가진 경로만.
+- **남은 한계**: 부수효과 저장과 reply/command **발행은 여전히 별개**(dual-write) — DB 커밋 후 발행 직전에 죽으면 사가가 멈춘다. inbox는 "중복"을 막지만 "발행 누락"은 못 막는다 → **4e Outbox**.
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -466,8 +548,7 @@ GET /orders/3 → `CANCELLED`, 결제 `REFUNDED`, 재고 98 그대로. **오케�
 
 ---
 
-## 다음 — Step 4d~4e 예고
+## 다음 — Step 4e 예고
 
-4c로 choreography ↔ orchestration 대조까지 확인. 남은 것:
-- **4d — 멱등성(idempotency)**: at-least-once 중복 소비로 재고가 두 번 깎이거나 결제가 두 번 되는 걸 막는다(처리한 이벤트/주문 ID 기록).
-- **4e — Outbox 패턴**: "DB 저장 + 이벤트 발행"이 한 트랜잭션이 아니라서 생기는 발행 원자성 문제(dual-write)를 outbox 테이블 + relay로 해결.
+4d로 멱등 소비(inbox)까지 확인 — 같은 메시지를 재배달해도 결제·차감·환불·재고명령이 한 번만 일어난다. 남은 것:
+- **4e — Outbox 패턴**: inbox는 "중복 소비"를 막지만, 부수효과 저장과 **메시지 발행이 여전히 별개 트랜잭션(dual-write)** 이라 "DB는 커밋됐는데 발행 직전 죽음 = 사가 멈춤(발행 누락)"은 못 막는다. outbox 테이블에 발행할 메시지를 같은 트랜잭션으로 적재 + relay가 비동기 발행해 **저장과 발행을 원자적으로** 만든다.
