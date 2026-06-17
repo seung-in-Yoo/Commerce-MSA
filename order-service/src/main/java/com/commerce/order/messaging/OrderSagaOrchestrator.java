@@ -100,7 +100,7 @@ public class OrderSagaOrchestrator {
             }
             case FAILED -> {
                 // 보상: 이미 승인된 결제를 환불하라고 명령하고, 주문을 취소
-                commandPublisher.sendRefundPayment(new RefundPaymentCommand(order.getId()));
+                commandPublisher.sendRefundPayment(RefundPaymentCommand.create(order.getId()));
                 order.cancel();
                 log.warn("[order] 재고 실패 -> 결제 환불 명령 + 주문 취소(CANCELLED) orderId={}, reason={}",
                         order.getId(), reply.reasonCode());
