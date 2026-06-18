@@ -697,6 +697,43 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
+## Step 5c — Circuit Breaker (Resilience4j, 게이트웨이 다운스트림 격리)
+
+### 직전의 고통
+5a에서 게이트웨이가 백엔드 health를 일부러 안 기다리게 두고("5c에서 다룬다") 백엔드를 안 띄우니 **raw 500**(NXDOMAIN)이 나왔다. 그대로 두면: 백엔드가 죽거나 느릴 때 게이트웨이는 **타임아웃까지 기다렸다 실패**(fail-slow)하고, 요청이 쌓이면 스레드/커넥션이 묶여 **멀쩡한 다른 라우트까지 느려진다(장애 전파)**. 죽은 서비스를 계속 때려 회복도 방해하고, 사용자에겐 그냥 500(우아한 저하 없음).
+
+### 핵심 개념 — 회로 차단기 + 상태머신
+- 다운스트림 호출을 감싸 실패율을 보다가, 임계치를 넘으면 **회로를 열어** 호출을 막고 즉시 폴백.
+- **CLOSED**(정상, 실패 집계) → **OPEN**(차단, 즉시 폴백, fail-fast) → **HALF_OPEN**(대기시간 후 시험 호출) → 성공하면 CLOSED / 실패하면 OPEN.
+- **어디에 거나**: Circuit Breaker는 **동기 호출**을 위한 도구다. 우리 서비스 간 사가는 전부 **Kafka(비동기)**라 대상이 아니다(컨슈머가 죽어도 메시지는 큐에 쌓일 뿐 호출 스레드가 막히지 않는다). **남은 동기 호출 = 게이트웨이→백엔드(HTTP)** 한 곳 → 거기에만 건다.
+
+### 설계 결정
+- **Spring Cloud Gateway + Resilience4j(reactor) 통합.** 라우트에 `CircuitBreaker` 필터 + `fallbackUri`를 붙이면, 실패/OPEN 시 게이트웨이가 폴백 경로로 forward한다.
+- **라우트마다 독립 인스턴스**(order/product/payment 각각). product가 죽어 그 회로가 OPEN돼도 order/payment 회로는 영향 없음 = **의존성별 격리**. 공통값은 `configs.default` + `base-config`로 상속(중복 제거).
+- **폴백은 게이트웨이 안의 컨트롤러**(`/fallback/{서비스}`)가 503 + 친절한 본문 반환.
+- 회로 상태는 actuator(`/actuator/circuitbreakers`, `/health`)로 노출 → 전이를 눈으로.
+
+### 무엇을 만들었나 (조각별)
+- **조각 1**: `spring-cloud-starter-circuitbreaker-reactor-resilience4j` + **product 라우트** CircuitBreaker 필터 + `FallbackController`(503) + resilience4j 설정(window10/최소5/실패율50%/OPEN 10s/half-open 3) + actuator.
+- **조각 2**: **order·payment 라우트로 확대**(독립 인스턴스 3개), 폴백 컨트롤러에 endpoint 추가, 설정을 `configs.default` 상속 구조로 리팩터.
+
+### 직접 관찰한 것
+**상태머신 한 바퀴 (product 라우트)**: product 정상 → 200/CLOSED. `docker compose stop product-service` 후 호출 → 모두 **폴백 503**, 실패 누적되자 **CLOSED→OPEN**. OPEN 중엔 product를 **안 부르고 즉시 폴백**(fail-fast). product 재기동 + 10s 후 **HALF_OPEN** 자동 전이 → 시험 호출 성공 → **CLOSED** 복귀(200).
+```
+정상:   200  state=CLOSED
+다운:   503(폴백) ... → state=OPEN  (이후 product 호출 안 함)
+복구:   200  state=HALF_OPEN → HALF_OPEN → CLOSED
+```
+**의존성별 격리**: product만 죽이고 그 라우트를 6번 때려 `productCircuitBreaker`만 OPEN으로 만든 뒤, order/payment를 호출 → 두 회로는 **CLOSED 유지**. 한 다운스트림의 장애가 다른 회로로 번지지 않음.
+
+### 배운 것
+- **Circuit Breaker는 동기 호출의 도구다.** 비동기(Kafka)에는 안 쓴다 — 큐가 이미 시간 결합을 끊어줬기 때문. "어디가 동기 경계인가"를 알면 어디에 걸지가 정해진다.
+- **fail-fast가 핵심 가치.** 죽은 서비스를 기다리지 않고 즉시 폴백 → 게이트웨이 자원을 지키고(다른 라우트 보호) 죽은 서비스의 회복을 방해하지 않는다.
+- **격리는 "인스턴스 분리"로 산다.** 회로를 의존성별로 나눠야 한 서비스 장애가 전체로 안 번진다(bulkhead의 사상).
+- **우아한 저하 ≠ 성공.** 폴백 503은 "실패를 사용자에게 친절하게 알리는 것"이지 요청을 성공시키는 게 아니다. 무엇을 폴백으로 줄지(에러/캐시/기본값)는 도메인 판단.
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -707,9 +744,3 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 4. **관찰 가능성(observability)이 학습의 핵심 도구** probe, healthcheck, 로그(`[order] 발행 → [product] 수신`), consumer offset/lag — 이게 없었으면 "비동기가 됐다"를 *믿을* 수만 있고 *볼* 수는 없었다.
 
 ---
-
-## 다음 — Step 5 예고
-
-Step 4(Saga)는 4a~4e로 마무리됐다. 보상 루프(4a) → 결제 추가 3-step choreography(4b) → orchestration 대조(4c) → 멱등 소비(4d) → outbox(4e)까지, 분산 트랜잭션의 정합성을 이벤트/사가/inbox/outbox로 닫았다. 남은 것:
-- **Step 5 — API Gateway · 분산 추적 · Circuit Breaker(Resilience4j)**: 지금은 서비스마다 포트가 흩어져 있고(8080/8081/8082), 한 주문이 order→payment→product를 거치는 흐름을 로그를 `grep`으로 이어 붙여 본다. 게이트웨이로 진입점을 모으고, 분산 추적(trace id)으로 한 요청의 전체 경로를 한 줄로 잇고, Circuit Breaker로 의존 서비스 장애를 격리한다.
-- **(보류) outbox 확장**: payment·product의 reply 발행에 남은 dual-write. 같은 패턴이라 학습 가치가 낮아 미뤘다 — 운영 관점이 필요해지면 그때.

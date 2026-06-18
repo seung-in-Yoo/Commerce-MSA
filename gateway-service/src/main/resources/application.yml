@@ -12,20 +12,68 @@ spring:
               uri: ${ORDER_SERVICE_URI:http://localhost:8080}
               predicates:
                 - Path=/api/v1/orders/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: orderCircuitBreaker
+                    fallbackUri: forward:/fallback/orders
             # 상품 API -> product-service
             - id: product-service
               uri: ${PRODUCT_SERVICE_URI:http://localhost:8081}
               predicates:
                 - Path=/api/v1/products/**
+              # Circuit Breaker: 다운스트림(product) 실패/지연이 쌓이면 회로를 열어 즉시 폴백
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: productCircuitBreaker
+                    fallbackUri: forward:/fallback/products
             # 결제 API -> payment-service
             - id: payment-service
               uri: ${PAYMENT_SERVICE_URI:http://localhost:8082}
               predicates:
                 - Path=/api/v1/payments/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: paymentCircuitBreaker
+                    fallbackUri: forward:/fallback/payments
 
 server:
   # compose에서는 SERVER_PORT=8080으로 띄우고 GATEWAY_PORT로 호스트에 매핑
   port: ${SERVER_PORT:8000}
+
+# Circuit Breaker 설정 (CircuitBreaker 필터의 name과 매칭)
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED       # 최근 N'개' 호출 기준
+        sliding-window-size: 10
+        minimum-number-of-calls: 5             # 최소 5건은 모여야 실패율 계산(성급한 OPEN 방지)
+        failure-rate-threshold: 50             # 실패율 50% 초과 -> OPEN
+        wait-duration-in-open-state: 10s       # OPEN 유지 시간(이후 HALF_OPEN)
+        permitted-number-of-calls-in-half-open-state: 3   # 간보기 시험 호출 수
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true        # /actuator/health에 회로 상태 노출
+    instances:
+      orderCircuitBreaker:
+        base-config: default
+      productCircuitBreaker:
+        base-config: default
+      paymentCircuitBreaker:
+        base-config: default
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 3s
+    instances:
+      orderCircuitBreaker:
+        base-config: default
+      productCircuitBreaker:
+        base-config: default
+      paymentCircuitBreaker:
+        base-config: default
 
 management:
   # 분산추적: 게이트웨이가 trace를 시작해 다운스트림으로 전파 -> Zipkin으로 전송
@@ -38,8 +86,8 @@ management:
   endpoints:
     web:
       exposure:
-        # gateway: 등록된 라우트를 /actuator/gateway/routes로 조회
-        include: health,info,prometheus,gateway
+        # gateway: 라우트 조회 / circuitbreakers: 회로 상태(CLOSED/OPEN/HALF_OPEN) 조회
+        include: health,info,prometheus,gateway,circuitbreakers
   endpoint:
     # gateway 엔드포인트는 노출만으로는 안 뜨고 access를 열어줘야 함
     gateway:
