@@ -4,12 +4,75 @@
 
 ## 목차
 
-| ID | 날짜 | 단계 | 한 줄 요약                                                                 |
-|---|---|---|------------------------------------------------------------------------|
-| [TS-4](#ts-4--멀티타입-컨슈머에서-단일-valuedefaulttype의-한계) | 2026-06-16 | step4b | 두 토픽 구독 컨슈머에서 `containerFactory` 설정 없음 → 단일 default 타입이 다른 타입을 못 받고 깨짐 |
-| [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비             |
-| [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)              |
-| [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                         |
+| ID | 날짜 | 단계 | 한 줄 요약                                                                        |
+|---|---|---|-------------------------------------------------------------------------------|
+| [TS-5](#ts-5--게이트웨이-actuatorgatewayroutes-404) | 2026-06-18 | step5a | `/actuator/gateway/routes` 404 — `exposure.include`만 하고 엔드포인트 `access`를 안 열었음 |
+| [TS-4](#ts-4--멀티타입-컨슈머에서-단일-valuedefaulttype의-한계) | 2026-06-16 | step4b | 두 토픽 구독 컨슈머에서 `containerFactory` 설정 없음 → 단일 default 타입이 다른 타입을 못 받고 깨짐        |
+| [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
+| [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
+| [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-5 — 게이트웨이 `actuator/gateway/routes` 404 — 노출만 하고 access를 안 열었다
+
+- **날짜**: 2026-06-18
+- **단계**: step5a (API Gateway 도입 — 단일 진입점 + 경로 라우팅)
+
+### 배경 — 등록된 라우트 목록을 확인하려 했다
+
+`gateway-service`(Spring Cloud Gateway 2025.0.0, `:8000`)를 띄우고, 라우팅이 의도대로 등록됐는지
+`/actuator/gateway/routes`로 확인하려 했다. `application.yml`에서 분명히 노출은 해 둔 상태였다:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,gateway   # gateway 노출함
+```
+
+### 증상
+
+```
+$ curl http://localhost:8000/actuator/gateway/routes
+{"status":404,"error":"Not Found","path":"/actuator/gateway/routes", ...}
+```
+
+`/actuator/health`는 200으로 잘 뜨는데 `gateway`만 404. exposure에 분명히 넣었는데도 안 보였다.
+
+### 원인 — 노출(exposure) ≠ 접근 허용(access)
+
+`gateway`처럼 라우트·필터 같은 **운영 정보를 드러내는 엔드포인트**는 `exposure.include`로 HTTP에 노출하는 것만으로는 부족하다. 엔드포인트의 **access**가 기본적으로 닫혀 있어서, 노출돼 있어도 접근이 막히면 404로 나간다.
+
+### 해결
+
+`application.yml`에 게이트웨이 엔드포인트 access를 명시적으로 연다:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,gateway
+  endpoint:
+    gateway:
+      access: unrestricted        # 노출(include)만으로는 부족 — access를 열어야 200
+```
+
+확인:
+
+```
+$ curl http://localhost:8000/actuator/gateway/routes        # HTTP 200
+order-service   -> http://order-service:8080
+product-service -> http://product-service:8080
+payment-service -> http://payment-service:8080
+```
+
+### 교훈
+
+- **노출(`exposure.include`) ≠ 접근 허용(`access`).** actuator 엔드포인트는 두 관문을 다 통과해야 보인다. include만 보고 "열었다"고 착각하면, 다른 엔드포인트(`health`)는 멀쩡히 뜨는데 특정 엔드포인트만 404라 원인을 잡기 어렵다.
+- **Boot 3.5부터 `enabled` → `access`.** `management.endpoint.*.enabled`는 deprecated. `access`(`none`/`read-only`/`unrestricted`)로 표현한다.
 
 ---
 
