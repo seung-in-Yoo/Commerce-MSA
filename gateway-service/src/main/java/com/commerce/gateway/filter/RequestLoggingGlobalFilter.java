@@ -1,5 +1,7 @@
 package com.commerce.gateway.filter;
 
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
@@ -18,6 +20,12 @@ public class RequestLoggingGlobalFilter implements GlobalFilter, Ordered {
 
 	private static final Logger log = LoggerFactory.getLogger(RequestLoggingGlobalFilter.class);
 
+	private final Tracer tracer;
+
+	public RequestLoggingGlobalFilter(Tracer tracer) {
+		this.tracer = tracer;
+	}
+
 	@Override
 	public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
 		long startMillis = System.currentTimeMillis();
@@ -26,11 +34,13 @@ public class RequestLoggingGlobalFilter implements GlobalFilter, Ordered {
 		String path = request.getURI().getRawPath();
 
 		return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+			Span currentSpan = tracer.currentSpan();
+			String traceId = (currentSpan != null) ? currentSpan.context().traceId() : "no-trace";
 			Route route = exchange.getAttribute(ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR);
 			String routeId = (route != null) ? route.getId() : "no-route";
 			long tookMillis = System.currentTimeMillis() - startMillis;
-			log.info("[gateway] {} {} -> route={} status={} ({}ms)",
-					method, path, routeId, exchange.getResponse().getStatusCode(), tookMillis);
+			log.info("[gateway] traceId={} {} {} -> route={} status={} ({}ms)",
+					traceId, method, path, routeId, exchange.getResponse().getStatusCode(), tookMillis);
 		}));
 	}
 

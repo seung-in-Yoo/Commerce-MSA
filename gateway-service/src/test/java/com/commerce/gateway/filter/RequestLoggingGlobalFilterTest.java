@@ -1,5 +1,6 @@
 package com.commerce.gateway.filter;
 
+import io.micrometer.tracing.Tracer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -16,7 +17,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("RequestLoggingGlobalFilter 단위 테스트")
 class RequestLoggingGlobalFilterTest {
 
-	private final RequestLoggingGlobalFilter filter = new RequestLoggingGlobalFilter();
+	private final RequestLoggingGlobalFilter filter = new RequestLoggingGlobalFilter(Tracer.NOOP);
 
 	@Nested
 	@DisplayName("filter")
