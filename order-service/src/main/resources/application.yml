@@ -44,6 +44,13 @@ product:
     url: ${PRODUCT_SERVICE_URL:http://localhost:8081}
 
 management:
+  # 분산추적: 모든 hop에 trace id 전파 -> Zipkin으로 전송
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
   endpoints:
     web:
       exposure:
