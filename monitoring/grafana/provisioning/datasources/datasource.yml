@@ -12,3 +12,23 @@ datasources:
     editable: false
     jsonData:
       timeInterval: 15s
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: ",(\\w+),\\w+\\]"
+          url: "${__value.raw}"
+          datasourceUid: zipkin
+
+  - name: Zipkin
+    type: zipkin
+    uid: zipkin
+    access: proxy
+    url: http://zipkin:9411
+    editable: false
