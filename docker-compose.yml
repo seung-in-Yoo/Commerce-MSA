@@ -1,11 +1,3 @@
-# 2단계: 서비스 2개(order, product) + DB 2개(order-db, product-db)
-#
-# 핵심 포인트
-# - 각 서비스는 자기 DB만 소유 (DB per service). order는 product의 테이블을 모름
-# - order-service는 product-service를 'product-service'라는 DNS로 호출 (PRODUCT_SERVICE_URL)
-# - order-service는 product-service의 health를 '기다리지 않는다' (depends_on에 product 없음)
-# - product가 죽어도 order는 떠 있고, '주문 요청을 받는 순간' 실패가 전파되는 걸 관찰해보기
-
 services:
   order-db:
     image: mysql:8.0
@@ -149,7 +141,26 @@ services:
     networks:
       - commerce-net
 
-  # 3단계: 이벤트 브로커. 단일 브로커 KRaft 모드(주키퍼 없음).
+  gateway-service:
+    build:
+      context: ./gateway-service
+    environment:
+      SERVER_PORT: 8080
+      ORDER_SERVICE_URI: http://order-service:8080
+      PRODUCT_SERVICE_URI: http://product-service:8080
+      PAYMENT_SERVICE_URI: http://payment-service:8080
+    ports:
+      - "${GATEWAY_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - commerce-net
+
+  # 3단계: 이벤트 브로커. 단일 브로커 KRaft 모드
   # 리스너 2개:
   #   - PLAINTEXT(kafka:9092): compose 네트워크 안의 서비스들이 쓰는 주소
   #   - EXTERNAL(localhost:9094): 맥(호스트)에서 IDE로 직접 띄울 때 쓰는 주소
