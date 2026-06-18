@@ -201,6 +201,31 @@ services:
       - "${GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
+      - loki
+    networks:
+      - commerce-net
+
+  # 모니터링: 로그 저장소(로그용 Prometheus)
+  loki:
+    image: grafana/loki:3.0.0
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    networks:
+      - commerce-net
+
+  # 모니터링: 로그 수집 에이전트 -> 도커 소켓으로 컨테이너 stdout을 tail해 Loki로 push
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
     networks:
       - commerce-net
 
@@ -241,6 +266,7 @@ volumes:
   payment-db-data:
   prometheus-data:
   grafana-data:
+  loki-data:
 
 networks:
   commerce-net:
