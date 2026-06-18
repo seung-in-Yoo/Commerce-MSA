@@ -31,6 +31,8 @@ services:
       PRODUCT_SERVICE_URL: http://product-service:8080
       # Kafka 브로커도 DNS로
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 분산추적 span을 보낼 Zipkin도 DNS로
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "${ORDER_SERVICE_PORT}:8080"
     depends_on:
@@ -77,6 +79,7 @@ services:
       SPRING_DATASOURCE_USERNAME: ${PRODUCT_DB_USER}
       SPRING_DATASOURCE_PASSWORD: ${PRODUCT_DB_PASSWORD}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "${PRODUCT_SERVICE_PORT}:8080"
     depends_on:
@@ -125,6 +128,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       # 결제 승인 한도
       PAYMENT_APPROVAL_LIMIT: ${PAYMENT_APPROVAL_LIMIT:-1000000}
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "${PAYMENT_SERVICE_PORT}:8080"
     depends_on:
@@ -149,6 +153,7 @@ services:
       ORDER_SERVICE_URI: http://order-service:8080
       PRODUCT_SERVICE_URI: http://product-service:8080
       PAYMENT_SERVICE_URI: http://payment-service:8080
+      ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "${GATEWAY_PORT}:8080"
     healthcheck:
@@ -157,6 +162,16 @@ services:
       timeout: 5s
       retries: 5
       start_period: 40s
+    networks:
+      - commerce-net
+
+  # 5단계(5b): 분산추적 수집기 + UI. 서비스들이 보낸 span을 모아 워터폴로 보여준다.
+  # - in-memory 저장(재시작하면 trace 사라짐 — 학습용이라 충분).
+  # - 어떤 서비스도 zipkin에 depends_on 하지 않는다: 추적은 best-effort, zipkin이 없어도 서비스는 떠야 한다.
+  zipkin:
+    image: openzipkin/zipkin:3
+    ports:
+      - "${ZIPKIN_PORT:-9411}:9411"
     networks:
       - commerce-net
 
