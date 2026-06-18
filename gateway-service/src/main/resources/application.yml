@@ -12,6 +12,11 @@ spring:
               uri: ${ORDER_SERVICE_URI:http://localhost:8080}
               predicates:
                 - Path=/api/v1/orders/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: orderCircuitBreaker
+                    fallbackUri: forward:/fallback/orders
             # 상품 API -> product-service
             - id: product-service
               uri: ${PRODUCT_SERVICE_URI:http://localhost:8081}
@@ -28,6 +33,11 @@ spring:
               uri: ${PAYMENT_SERVICE_URI:http://localhost:8082}
               predicates:
                 - Path=/api/v1/payments/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: paymentCircuitBreaker
+                    fallbackUri: forward:/fallback/payments
 
 server:
   # compose에서는 SERVER_PORT=8080으로 띄우고 GATEWAY_PORT로 호스트에 매핑
@@ -36,8 +46,8 @@ server:
 # Circuit Breaker 설정 (CircuitBreaker 필터의 name과 매칭)
 resilience4j:
   circuitbreaker:
-    instances:
-      productCircuitBreaker:
+    configs:
+      default:
         sliding-window-type: COUNT_BASED       # 최근 N'개' 호출 기준
         sliding-window-size: 10
         minimum-number-of-calls: 5             # 최소 5건은 모여야 실패율 계산(성급한 OPEN 방지)
@@ -46,10 +56,24 @@ resilience4j:
         permitted-number-of-calls-in-half-open-state: 3   # 간보기 시험 호출 수
         automatic-transition-from-open-to-half-open-enabled: true
         register-health-indicator: true        # /actuator/health에 회로 상태 노출
-  timelimiter:
     instances:
+      orderCircuitBreaker:
+        base-config: default
       productCircuitBreaker:
-        timeout-duration: 3s                   # 3s 넘는 호출은 실패로 간주(느린 호출 차단)
+        base-config: default
+      paymentCircuitBreaker:
+        base-config: default
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 3s
+    instances:
+      orderCircuitBreaker:
+        base-config: default
+      productCircuitBreaker:
+        base-config: default
+      paymentCircuitBreaker:
+        base-config: default
 
 management:
   # 분산추적: 게이트웨이가 trace를 시작해 다운스트림으로 전파 -> Zipkin으로 전송
