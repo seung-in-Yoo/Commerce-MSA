@@ -175,6 +175,17 @@ services:
     networks:
       - commerce-net
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # 시계열 데이터는 볼륨에 보관 (재시작해도 과거 메트릭 유지)
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - commerce-net
+
   # 3단계: 이벤트 브로커. 단일 브로커 KRaft 모드
   # 리스너 2개:
   #   - PLAINTEXT(kafka:9092): compose 네트워크 안의 서비스들이 쓰는 주소
@@ -210,6 +221,7 @@ volumes:
   order-db-data:
   product-db-data:
   payment-db-data:
+  prometheus-data:
 
 networks:
   commerce-net:
