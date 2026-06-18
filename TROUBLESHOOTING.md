@@ -6,12 +6,97 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-7](#ts-7--outboxstore-and-forward-경계가-분산추적-trace를-끊는다) | 2026-06-18 | step5b | Kafka 추적은 켰는데 사가가 한 trace로 안 묶임 — Outbox 릴레이가 다른 스레드/나중에 발행해 trace 단절 |
 | [TS-6](#ts-6--게이트웨이reactive-로그에-traceid가-안-찍힌다) | 2026-06-18 | step5b | reactive 게이트웨이 로그의 traceId 빈칸 — context를 조립 시점에 읽음 + 자동 컨텍스트 전파 미활성 |
 | [TS-5](#ts-5--게이트웨이-actuatorgatewayroutes-404) | 2026-06-18 | step5a | `/actuator/gateway/routes` 404 — `exposure.include`만 하고 엔드포인트 `access`를 안 열었음 |
 | [TS-4](#ts-4--멀티타입-컨슈머에서-단일-valuedefaulttype의-한계) | 2026-06-16 | step4b | 두 토픽 구독 컨슈머에서 `containerFactory` 설정 없음 → 단일 default 타입이 다른 타입을 못 받고 깨짐        |
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-7 — Outbox(store-and-forward) 경계가 분산추적 trace를 끊는다
+
+- **날짜**: 2026-06-18
+- **단계**: step5b (분산추적 — Kafka 전파)
+
+### 배경
+
+Kafka producer/consumer에 observation을 켜서(`KafkaTemplate.setObservationEnabled` / 컨테이너 `observationEnabled`)
+사가(주문→결제→재고)가 trace 헤더로 이어지길 기대했다. 목표는 "주문 한 건 = Zipkin에서 한 trace".
+
+### 증상
+
+Kafka 추적은 분명히 동작하는데, **주문 한 건이 Zipkin에서 3개의 분리된 trace**로 쪼개졌다.
+
+```
+trace #1  gateway → order (HTTP)                                   ← 유저 요청, 여기서 끝
+trace #2  outbox-relay.publish → payment-commands → payment → payment-replies → order
+trace #3  outbox-relay.publish → stock-commands  → product → stock-replies  → order
+```
+
+trace #2·#3의 **루트가 `task outbox-relay.publish-pending`**(스케줄러 폴링)이고, 유저 요청(#1)과 이어지지 않았다.
+
+### 원인 — store-and-forward가 trace context를 떨군다
+
+order는 사가 명령을 Kafka로 직접 쏘지 않고 **Outbox 테이블에 적재**한다([[step4-plan]] 4e). 실제 발행은
+별도 `@Scheduled` 릴레이가 **나중에, 다른 스레드**로 한다.
+
+1. 유저 요청(trace A)은 outbox 행을 **DB에 쓰고 끝난다.** 발행이 일어나지 않으므로 trace A는 거기서 종료.
+2. 릴레이 폴러는 **자기만의 trace(스케줄러)**로 깨어나 행을 읽어 발행한다. KafkaTemplate observation은 그 시점의
+   현재 trace(=스케줄러)를 헤더에 실으므로, 컨슈머들은 **스케줄러 trace**를 이어받는다 → 유저 요청과 단절.
+3. order가 결제 응답을 받아(스케줄러 trace) 다음 명령을 또 outbox에 쓰면, 그것도 **다음 폴링의 또 다른 trace**로
+   발행된다 → 사가가 폴링 경계마다 조각난다.
+
+즉 **observation을 켠 것만으로는 부족하다.** 비동기 store-and-forward(아웃박스/큐/배치)는 "지금 이 스레드의 trace"를
+잃어버리는 경계다.
+
+### 해결 — 적재 시점의 trace context를 행에 저장하고, 발행 시 복원
+
+(1) 적재(`SagaCommandPublisher`): 현재 trace를 전파 carrier로 추출해 outbox 행에 함께 저장.
+
+```java
+private String captureTraceContext() {
+    Span span = tracer.currentSpan();
+    if (span == null) return null;
+    Map<String, String> carrier = new HashMap<>();
+    propagator.inject(span.context(), carrier, (c, k, v) -> c.put(k, v));   // 전파 포맷 무관
+    return serialize(carrier);                                              // 행의 trace_context 컬럼에 저장
+}
+```
+
+(2) 발행(`OutboxRelay`): 저장한 context를 복원한 span scope **안에서** 발행 → KafkaTemplate observation이
+**원래 trace**를 부모로 헤더에 싣는다.
+
+```java
+private void send(OutboxMessage message) {
+    Span restored = restoreSpan(message);                  // propagator.extract(carrier).start()
+    if (restored == null) { doSend(message); return; }
+    try (Tracer.SpanInScope ignored = tracer.withSpan(restored)) {
+        doSend(message);                                   // 이 안에서 발행 -> 원래 trace로 전파
+    } finally {
+        restored.end();
+    }
+}
+```
+
+확인 — 주문 한 건이 **한 trace(13 span, 4개 서비스)**로 이어진다:
+
+```
+gateway POST → order POST → outbox-relay.publish → payment-commands send → payment receive
+            → payment-replies send → order receive → outbox-relay.publish → stock-commands send
+            → product receive → stock-replies send → order receive
+```
+
+### 교훈
+
+- **분산추적의 진짜 적은 비동기 경계다.** HTTP·동기 Kafka는 observation만 켜면 알아서 전파되지만,
+  **Outbox/큐/스케줄러처럼 "나중에 다른 스레드가 발행"하는 store-and-forward는 trace를 떨군다.**
+- **컨텍스트를 데이터와 함께 저장하라.** 메시지를 영속화할 때 trace context(carrier)도 같이 적재하고,
+  발행 시 복원해 scope를 열면 끊긴 trace가 다시 이어진다. (멱등 키 `messageId`를 행에 저장한 것과 같은 발상)
+- **`Propagator` 추상화로 포맷 의존을 피한다.** traceparent 문자열을 손으로 만들지 말고 inject/extract를 쓰면
+  B3/W3C 어느 포맷이든 대칭으로 동작한다.
 
 ---
 
