@@ -43,6 +43,8 @@ public class KafkaConsumerConfig {
 
         ConcurrentKafkaListenerContainerFactory<String, T> factory = new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory);
+        // 분산추적: 수신 시 Kafka 헤더의 trace context를 이어받아 같은 trace로 묶는다
+        factory.getContainerProperties().setObservationEnabled(true);
         return factory;
     }
 
