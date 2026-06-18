@@ -14,9 +14,9 @@ class OutboxMessageTest {
     class Create {
 
         @Test
-        @DisplayName("성공 - 생성 시 id 발급 + PENDING 상태 + sentAt은 null")
+        @DisplayName("성공 - 생성 시 id 발급 + PENDING 상태 + sentAt은 null + traceContext 보관")
         void success() {
-            OutboxMessage message = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}");
+            OutboxMessage message = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}", "{\"traceparent\":\"00-abc-def-01\"}");
 
             assertThat(message.getId()).isNotBlank();
             assertThat(message.getTopic()).isEqualTo("payment-commands");
@@ -25,6 +25,7 @@ class OutboxMessageTest {
             assertThat(message.getStatus()).isEqualTo(OutboxStatus.PENDING);
             assertThat(message.getCreatedAt()).isNotNull();
             assertThat(message.getSentAt()).isNull();
+            assertThat(message.getTraceContext()).isEqualTo("{\"traceparent\":\"00-abc-def-01\"}");
         }
     }
 
@@ -35,7 +36,7 @@ class OutboxMessageTest {
         @Test
         @DisplayName("성공 - 상태가 SENT로 바뀌고 sentAt이 채워진다")
         void success() {
-            OutboxMessage message = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}");
+            OutboxMessage message = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}", null);
 
             message.markSent();
 

@@ -49,17 +49,23 @@ public class OutboxMessage {
     // 발행 완료 시각(PENDING 동안은 null)
     private LocalDateTime sentAt;
 
-    private OutboxMessage(String topic, String messageKey, String payload) {
+    // 분산추적: 적재 시점의 trace context
+    @Lob
+    @Column(columnDefinition = "TEXT")
+    private String traceContext;
+
+    private OutboxMessage(String topic, String messageKey, String payload, String traceContext) {
         this.id = UUID.randomUUID().toString();
         this.topic = topic;
         this.messageKey = messageKey;
         this.payload = payload;
         this.status = OutboxStatus.PENDING;
         this.createdAt = LocalDateTime.now();
+        this.traceContext = traceContext;
     }
 
-    public static OutboxMessage create(String topic, String messageKey, String payload) {
-        return new OutboxMessage(topic, messageKey, payload);
+    public static OutboxMessage create(String topic, String messageKey, String payload, String traceContext) {
+        return new OutboxMessage(topic, messageKey, payload, traceContext);
     }
 
     // 릴레이가 실제 발행에 성공하면 호출 -> 다음 폴링에서 다시 잡음

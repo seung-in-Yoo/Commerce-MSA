@@ -28,6 +28,13 @@ server:
   port: ${SERVER_PORT:8000}
 
 management:
+  # 분산추적: 게이트웨이가 trace를 시작해 다운스트림으로 전파 -> Zipkin으로 전송
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_ENDPOINT:http://localhost:9411/api/v2/spans}
   endpoints:
     web:
       exposure:

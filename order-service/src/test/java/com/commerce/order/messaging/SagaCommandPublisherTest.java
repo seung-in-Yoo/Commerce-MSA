@@ -7,6 +7,8 @@ import com.commerce.order.messaging.outbox.OutboxMessage;
 import com.commerce.order.messaging.outbox.OutboxMessageRepository;
 import com.commerce.order.messaging.outbox.OutboxStatus;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -37,11 +39,17 @@ class SagaCommandPublisherTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    @Mock
+    private Tracer tracer;
+
+    @Mock
+    private Propagator propagator;
+
     private SagaCommandPublisher publisher;
 
     @BeforeEach
     void setUp() {
-        publisher = new SagaCommandPublisher(outboxRepository, objectMapper);
+        publisher = new SagaCommandPublisher(outboxRepository, objectMapper, tracer, propagator);
     }
 
     @Nested

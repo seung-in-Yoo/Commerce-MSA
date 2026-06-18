@@ -618,6 +618,85 @@ ERROR ... java.lang.RuntimeException: [임시] dual-write 관찰용 강제 롤�
 
 ---
 
+## Step 5a — API Gateway (단일 진입점 + 경로 라우팅 + 횡단 로깅)
+
+### 직전의 고통
+4단계까지 진입점이 **포트로 흩어져** 있었다 — 주문 8080, 상품 8081, 결제 8082. 클라이언트가 "어느 기능이 어느 포트"라는 **서비스 토폴로지를 직접 알아야** 했고, 로깅·인증 같은 횡단 관심사를 넣으려면 서비스마다 반복해야 했다. 게다가 곧 할 분산추적(5b)·서킷브레이커(5c)가 올라탈 **공통 진입점**이 없었다.
+
+### 핵심 개념 — Gateway = 단일 진입점 + 경로 기반 라우팅
+- 클라이언트는 게이트웨이(`:8000`) 하나만 안다. 게이트웨이가 경로 prefix로 뒤의 서비스를 골라 프록시한다.
+- 뒤 서비스의 호스트/포트가 바뀌어도 클라이언트는 무영향(게이트웨이 라우트만 수정). 토폴로지가 클라이언트에서 분리된다.
+- 모든 트래픽이 한 곳을 지나므로 **횡단 관심사(로깅/추적/인증/rate-limit)를 게이트웨이에서 한 번만** 처리한다.
+
+### 설계 결정
+- **Spring Cloud Gateway(2025.0.0, server-webflux).** Netty 기반 reactive 라우터. 2025.0.0에서 스타터/프로퍼티명이 바뀐 점 반영: `spring-cloud-starter-gateway-server-webflux`, route prefix `spring.cloud.gateway.server.webflux.routes`(구 `spring-cloud-starter-gateway`/`spring.cloud.gateway.routes`는 deprecated).
+- **경로는 다운스트림과 동일**(`/api/v1/{orders,products,payments}`) → `StripPrefix` 불필요.
+- **라우팅 대상도 DNS(서비스 이름)으로**(고정 IP 금지 습관 유지).
+- **stateless** — 게이트웨이는 자기 DB/Kafka가 없다.
+- **백엔드 health를 기다리지 않는다**(`depends_on` 비움). order가 product를 안 기다린 것과 같은 철학 → 백엔드 부재가 런타임 에러로 드러나고, 그 격리/폴백은 **5c(서킷브레이커)**에서 다룬다.
+
+### 무엇을 만들었나 
+- **1. 스캐폴드 + 라우팅**: `gateway-service` 모듈 + `application.yml`에 라우트 3개 + compose에 추가 + `GATEWAY_PORT`. `/actuator/gateway/routes`로 등록 라우트 조회.
+- **2. 횡단 로깅**: `RequestLoggingGlobalFilter`(`GlobalFilter`, HIGHEST_PRECEDENCE) — 전 요청을 게이트웨이 한 곳에 `[gateway] method path -> route status (ms)`로 기록.
+
+### 직접 관찰한 것
+- 게이트웨이 한 포트(`:8000`)로 `GET /api/v1/products/1`, `POST /api/v1/orders` 둘 다 닿음(각각 product/order로 라우팅) → **8080/8081을 직접 몰라도 됨**.
+- 모든 요청이 게이트웨이 로그 한 곳에 한 줄로 찍힘.
+- **막힌 것(TS-5)**: `/actuator/gateway/routes`가 404. `exposure.include`로 노출만 해선 부족하고 `management.endpoint.gateway.access=unrestricted`로 **access까지 열어야** 200(Boot 3.5에서 `enabled` deprecated→`access`).
+
+### 배운 것
+- **게이트웨이의 본질은 "토폴로지를 클라이언트에서 떼어내는 것".** 진입점을 모으면 그 뒤 구조를 자유롭게 바꿀 수 있다.
+- **단일 진입점은 횡단 관심사의 자리를 만든다.** 조각2 로깅 필터가 5b trace id가 올라탈 받침대가 됐다.
+- **actuator는 노출(`exposure`) ≠ 접근(`access`).** 운영 정보를 드러내는 엔드포인트는 두 관문을 다 통과해야 보인다.
+
+---
+
+## Step 5b — 분산추적 (Micrometer Tracing + Zipkin / HTTP·Kafka·Outbox 전 구간)
+
+### 직전의 고통
+4단계 내내 사가(주문→결제→재고, 실패 시 환불)를 쫓을 때 `docker compose logs`를 서비스별로 열고 **`orderId`로 grep해서 머릿속으로 이어 붙였다.** 게이트웨이까지 들어온 뒤엔 한 요청이 gateway→order(HTTP) + order→payment→product(Kafka)로 더 흩어지는데, 이들을 **하나로 묶는 공통 끈이 없었다.** 비즈니스 키(`orderId`)가 안 찍힌 로그(게이트웨이 라우팅, 직렬화 에러)는 아예 못 이었다.
+
+### 핵심 개념 — Trace/Span + Context Propagation
+- **Trace**: 한 요청이 시스템 전체를 지난 여정. **TraceId** 하나로 식별. **Span**: 그 안의 작업 단위(부모-자식 트리 = 워터폴).
+- **전파(propagation)**: 호출하는 쪽이 trace context를 **실어 보내고** 받는 쪽이 **이어받는다**. HTTP는 헤더(W3C `traceparent`/B3), Kafka는 **메시지 헤더**.
+- 스택: **Micrometer Tracing**(Sleuth 후継) + **Brave 브리지** + **Zipkin 리포터/UI**. 학습용이라 샘플링 100%.
+
+### 설계 결정
+- **자동 계측이 닿는 곳은 프로퍼티로, 안 닿는 곳은 코드로.** HTTP(gateway↔order)는 자동. Kafka는 observation을 켜야 하는데, **커스텀 컨테이너 팩토리/KafkaTemplate(TS-4의 타입별 팩토리)에는 프로퍼티가 적용되지 않아** 코드로 직접(`setObservationEnabled(true)`).
+- **Zipkin은 best-effort.** 어느 서비스도 zipkin에 `depends_on` 안 함(추적 인프라가 죽어도 서비스는 떠야 한다). in-memory 저장(학습용).
+
+### 무엇을 만들었나 
+- **1. 추적 기반 + HTTP + Zipkin**: 4개 서비스에 tracing 의존성/설정 + compose에 Zipkin. → gateway→order HTTP가 한 trace, 로그에 `[traceId,spanId]`
+- **2. Kafka 전파**: order/payment 커스텀 팩토리·템플릿에 observation 코드로 활성화 + 3서비스 프로퍼티
+- **3. Outbox 경계 잇기**: outbox 행에 trace context 저장(`SagaCommandPublisher`) → 릴레이가 복원해 발행(`OutboxRelay`)
+- **+ 게이트웨이 로그 fix**: reactive라 traceId가 안 박히던 문제(TS-6) 해결
+
+### 막힌 것 / 새 개념
+- **TS-6 — reactive 게이트웨이 로그의 traceId 빈칸**: trace context는 Mono **구독 시점**에만 ThreadLocal에 있어, 조립 시점에 읽으면 null. 콜백 안에서 읽기 + `Hooks.enableAutomaticContextPropagation()`로 해결.
+- **TS-7 — Outbox가 trace를 끊는다**: observation을 켜도 사가가 3조각으로 분리됐다. 릴레이가 **다른 스레드/나중에** 발행해 원 요청의 trace를 잃기 때문. **trace context를 메시지와 함께 저장→복원**해야 이어진다. (멱등 키 `messageId`를 행에 저장한 4d와 같은 발상)
+
+### 직접 관찰한 것
+**성공 사가** (정상 주문) → Zipkin에서 **한 trace, 13 span, 4개 서비스**:
+```
+gateway POST → order POST → outbox-relay.publish → payment-commands send → payment receive
+            → payment-replies send → order receive → outbox-relay.publish → stock-commands send
+            → product receive → stock-replies send → order receive
+```
+**실패→환불 보상 사가** (결제 승인되나 재고 부족) → **한 trace, 16 span**, 보상 구간까지 포함:
+```
+... → product(stock FAILED) → order receive → outbox-relay.publish
+    → payment-refund-commands send → payment receive(환불)
+```
+→ 게이트웨이가 로그에 찍은 그 traceId가 Zipkin trace와 동일. **`grep <traceId>` 하나로 그 요청의 전 구간 로그가 모인다.**
+
+### 배운 것
+- **분산추적의 진짜 적은 비동기 경계다.** HTTP·동기 Kafka는 observation만 켜면 전파되지만, **Outbox/큐/스케줄러 같은 store-and-forward는 trace를 떨군다** → 컨텍스트를 데이터와 함께 저장·복원해야 한다
+- **reactive에선 context가 ThreadLocal이 아니라 Reactor Context에 산다.** servlet 감각으로 "현재 span 읽기"를 하면 null. 콜백 안에서 + 자동 전파를 켜야 한다
+- **`Propagator` 추상화로 포맷 의존을 피한다.** traceparent를 손으로 만들지 말고 inject/extract를 쓰면 B3/W3C 어느 포맷이든 대칭
+- **trace는 grep의 상위호환.** 비즈니스 키로 잇던 것을 시스템이 발급한 id 하나로, 게다가 워터폴(어디서 몇 ms)까지 본다
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:

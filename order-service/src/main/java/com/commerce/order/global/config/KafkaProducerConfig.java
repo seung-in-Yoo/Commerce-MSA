@@ -27,6 +27,9 @@ public class KafkaProducerConfig {
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
 
         ProducerFactory<String, String> producerFactory = new DefaultKafkaProducerFactory<>(props);
-        return new KafkaTemplate<>(producerFactory);
+        KafkaTemplate<String, String> template = new KafkaTemplate<>(producerFactory);
+        // 분산추적: 발행 시 현재 trace context를 Kafka 헤더에 실어 보낸다
+        template.setObservationEnabled(true);
+        return template;
     }
 }
