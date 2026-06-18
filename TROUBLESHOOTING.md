@@ -6,11 +6,77 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-6](#ts-6--게이트웨이reactive-로그에-traceid가-안-찍힌다) | 2026-06-18 | step5b | reactive 게이트웨이 로그의 traceId 빈칸 — context를 조립 시점에 읽음 + 자동 컨텍스트 전파 미활성 |
 | [TS-5](#ts-5--게이트웨이-actuatorgatewayroutes-404) | 2026-06-18 | step5a | `/actuator/gateway/routes` 404 — `exposure.include`만 하고 엔드포인트 `access`를 안 열었음 |
 | [TS-4](#ts-4--멀티타입-컨슈머에서-단일-valuedefaulttype의-한계) | 2026-06-16 | step4b | 두 토픽 구독 컨슈머에서 `containerFactory` 설정 없음 → 단일 default 타입이 다른 타입을 못 받고 깨짐        |
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-6 — 게이트웨이(reactive) 로그에 traceId가 안 찍힌다
+
+- **날짜**: 2026-06-18
+- **단계**: step5b (분산추적 — Micrometer Tracing + Zipkin)
+
+### 배경
+
+분산추적을 켠 뒤, 게이트웨이의 요청 로깅 필터(`RequestLoggingGlobalFilter`)가 남기는 `[gateway] ...` 줄에도
+traceId가 함께 찍히길 기대했다. servlet 서비스(order/product/payment)는 자동으로 잘 찍혔다.
+
+### 증상
+
+게이트웨이 로그만 trace 상관관계 필드가 **빈칸**이었다. (Boot가 자동으로 붙이는 `[traceId,spanId]` 자리)
+
+```
+... [                                                 ] c.c.g.filter.RequestLoggingGlobalFilter : [gateway] GET /api/v1/products/1 -> route=product-service status=200 OK
+```
+
+명시적으로 `tracer.currentSpan()`을 읽어 찍어봐도 `traceId=no-trace`가 나왔다 — **현재 span이 null**이었다.
+반면 같은 요청의 **Zipkin trace와 다운스트림(order) 로그에는 traceId가 멀쩡히** 있었다(즉 추적 자체는 동작).
+
+### 원인 — reactive에선 trace context가 "조립 시점"이 아니라 "구독 시점"에 있다 + 자동 전파 미활성
+
+1. 게이트웨이는 WebFlux(reactive)다. 필터의 `filter()` 메서드 본문은 `Mono`를 **조립(assemble)** 할 뿐이고,
+   실제 실행은 나중에 **구독(subscribe)** 시점에 다른 스레드에서 일어난다. trace context(ThreadLocal)는
+   **구독 시점에만** 세팅되므로, 조립 시점에 `tracer.currentSpan()`을 읽으면 null이다.
+2. 게다가 reactive 콜백(`then(...)`) 안에서 읽더라도, **Reactor 자동 컨텍스트 전파**가 꺼져 있으면
+   reactor context에 있는 trace를 ThreadLocal로 복원해주지 않아 역시 null/빈칸이 된다.
+
+### 해결 — 콜백 안에서 읽기 + 자동 컨텍스트 전파 활성화
+
+(1) traceId 읽기를 `Mono` 조립 시점이 아니라 **reactive 콜백 안**으로 옮긴다:
+
+```java
+return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+    Span span = tracer.currentSpan();                       // 콜백 안에서 읽는다
+    String traceId = (span != null) ? span.context().traceId() : "no-trace";
+    log.info("[gateway] traceId={} {} {} -> route={} status={} ...", traceId, ...);
+}));
+```
+
+(2) 시작 시 **Reactor 자동 컨텍스트 전파**를 켠다(ThreadLocal 복원):
+
+```java
+public static void main(String[] args) {
+    Hooks.enableAutomaticContextPropagation();   // reactor context <-> ThreadLocal(MDC/trace) 자동 복원
+    SpringApplication.run(GatewayApplication.class, args);
+}
+```
+
+확인 — Boot 자동 MDC 패턴과 명시 로그 둘 다 채워진다:
+
+```
+... [6a335c8b323730c4e290b51df8423243-e290b51df8423243] ... : [gateway] traceId=6a335c8b323730c4e290b51df8423243 GET /api/v1/products/1 -> route=product-service status=200 OK (52ms)
+```
+
+### 교훈
+
+- **reactive에서 trace/MDC는 ThreadLocal이 아니라 Reactor Context에 산다.** servlet의 ThreadLocal 감각으로
+  "그냥 현재 span 읽으면 되겠지" 하면 null이 나온다. 값은 **콜백 안에서** 읽고, **자동 컨텍스트 전파**를 켜야 한다.
+- **추적이 깨진 게 아니라 '내 로그에서만' 안 보였다.** Zipkin·다운스트림 로그엔 멀쩡했다 — 증상 범위를 좁히면
+  (전체 추적 실패가 아니라 게이트웨이 자기 로그 한정) 원인이 전파/스레딩 문제로 좁혀진다.
 
 ---
 
