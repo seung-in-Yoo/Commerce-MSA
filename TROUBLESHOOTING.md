@@ -6,6 +6,7 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-8](#ts-8--grafana-datasource-loki-was-not-found--프로비저닝은-부팅-시-한-번만-읽는다) | 2026-06-18 | step6 | 대시보드에 `Datasource loki was not found` — datasource.yml에 Loki 추가했지만 grafana를 재기동 안 해 미반영 |
 | [TS-7](#ts-7--outboxstore-and-forward-경계가-분산추적-trace를-끊는다) | 2026-06-18 | step5b | Kafka 추적은 켰는데 사가가 한 trace로 안 묶임 — Outbox 릴레이가 다른 스레드/나중에 발행해 trace 단절 |
 | [TS-6](#ts-6--게이트웨이reactive-로그에-traceid가-안-찍힌다) | 2026-06-18 | step5b | reactive 게이트웨이 로그의 traceId 빈칸 — context를 조립 시점에 읽음 + 자동 컨텍스트 전파 미활성 |
 | [TS-5](#ts-5--게이트웨이-actuatorgatewayroutes-404) | 2026-06-18 | step5a | `/actuator/gateway/routes` 404 — `exposure.include`만 하고 엔드포인트 `access`를 안 열었음 |
@@ -13,6 +14,56 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-8 — Grafana "Datasource loki was not found" — 프로비저닝은 부팅 시 한 번만 읽는다
+
+- **날짜**: 2026-06-18
+- **단계**: step6 (모니터링 — Loki+Promtail 로그 집계 조각)
+
+### 증상
+
+조각3에서 `datasource.yml`에 Loki/Zipkin을 추가하고 `docker compose up -d loki promtail grafana` 후
+Grafana 대시보드(Logs)에 들어가니 **`Datasource loki was not found`**.
+
+`docker compose up -d` 출력을 보면 단서가 있었다:
+
+```
+✔ Container commerce-msa-grafana-1    Running     ← Started/Recreated 가 아니라 "Running"
+✔ Container commerce-msa-loki-1       Started
+✔ Container commerce-msa-promtail-1   Started
+```
+
+### 원인 — 기존 컨테이너는 재기동되지 않았고, 프로비저닝은 부팅 때만 읽힌다
+
+- Grafana는 **datasource/dashboard 프로비저닝 파일을 프로세스 시작 시점에 한 번만** 읽는다.
+- grafana 컨테이너는 조각2에서 **이미 떠 있었고**, 조각3 변경(`datasource.yml`에 Loki 추가, compose에 `depends_on: loki` 추가)은
+  compose가 보기에 **컨테이너를 재생성할 만큼의 스펙 변화가 아니었다** → grafana는 `Running` 상태로 그대로 유지.
+- 결국 grafana는 **새 datasource.yml을 다시 읽지 않았고**, 대시보드 JSON이 참조하는 `uid: loki`가 인스턴스에 없어 "not found".
+
+### 해결 — grafana만 재기동시켜 프로비저닝을 다시 읽게 한다
+
+```bash
+docker compose restart grafana
+```
+
+재기동 로그에서 등록 확인:
+
+```
+provisioning.datasources level=info msg="inserting datasource from configuration" name=Loki  uid=loki
+provisioning.datasources level=info msg="inserting datasource from configuration" name=Zipkin uid=zipkin
+```
+
+(`restart` 대신 `docker compose up -d --force-recreate grafana`도 동일 효과.)
+
+### 교훈
+
+- **프로비저닝 파일을 바꿨으면 그 컨테이너를 반드시 재기동**해야 반영된다. `up -d`가 `Running`이라 찍히면 변경이 안 먹은 것 —
+  `Recreated`/`Started`인지 출력을 확인하는 습관.
+- 헷갈리는 부수 로그와 진짜 원인을 분리할 것: 같은 로그의 `401 invalid password`(첫 로그인 후 admin 비번 변경 탓, API 호출 건),
+  `xychart already registered`, `provisioning/plugins|alerting ... no such file`은 전부 **무해한 잡음**이고 datasource 문제와 무관했다.
+- 향후 k8s에선 ConfigMap을 바꿔도 파드가 자동으로 다시 안 읽는 것과 같은 결의 함정 — "설정 파일 교체 ≠ 프로세스 재적재".
 
 ---
 
