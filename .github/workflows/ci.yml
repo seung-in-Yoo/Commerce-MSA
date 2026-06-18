@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: ["order-service", "product-service", "payment-service"]
+        service: ["order-service", "product-service", "payment-service", "gateway-service"]
 
     steps:
       - name: Checkout source
