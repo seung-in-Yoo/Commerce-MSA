@@ -1,5 +1,8 @@
 package com.commerce.order.messaging.outbox;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.tracing.Tracer;
+import io.micrometer.tracing.propagation.Propagator;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -35,6 +38,15 @@ class OutboxRelayTest {
     @Mock
     private KafkaTemplate<String, String> outboxKafkaTemplate;
 
+    @Mock
+    private Tracer tracer;
+
+    @Mock
+    private Propagator propagator;
+
+    @Mock
+    private ObjectMapper objectMapper;
+
     @Nested
     @DisplayName("publishPending")
     class PublishPending {
@@ -42,8 +54,8 @@ class OutboxRelayTest {
         @Test
         @DisplayName("성공 - PENDING 2건을 각각 발행하고 SENT로 마킹")
         void success() {
-            OutboxMessage m1 = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}");
-            OutboxMessage m2 = OutboxMessage.create("stock-commands", "2", "{\"orderId\":2}");
+            OutboxMessage m1 = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}", null);
+            OutboxMessage m2 = OutboxMessage.create("stock-commands", "2", "{\"orderId\":2}", null);
             given(outboxRepository.findTop100ByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING))
                     .willReturn(List.of(m1, m2));
             given(outboxKafkaTemplate.send(anyString(), anyString(), anyString()))
