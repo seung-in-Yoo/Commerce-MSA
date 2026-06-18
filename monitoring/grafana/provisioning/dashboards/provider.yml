@@ -1,0 +1,14 @@
+# Grafana 대시보드 프로비저닝
+apiVersion: 1
+
+providers:
+  - name: 'commerce-msa'
+    orgId: 1
+    folder: 'Commerce MSA'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

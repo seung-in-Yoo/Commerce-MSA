@@ -734,6 +734,47 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
+## Step 6 — 모니터링 (Prometheus + Grafana + Loki, observability 삼각형)
+
+> Phase 1 로드맵(1~5단계)은 5c로 완주했다. Step 6부터는 **확장 트랙(Phase 1.5)**. 순서는 6(측정) → 7(Kafka 성능) → 8(쿠버네티스)
+
+### 직전의 고통
+5b에서 trace(Zipkin)를, 액추에이터로 메트릭(`/actuator/prometheus`)을 노출은 했지만 — **관측 데이터가 세 군데로 흩어져** 있었다. 메트릭은 `curl`로 그 순간 스냅샷만, 로그는 `docker compose logs`로 터미널에 흩어지고, 트레이스는 Zipkin에 따로. 장애가 나면 "어디가 이상한지(메트릭) → 무슨 일이 났는지(로그) → 그 요청의 전체 경로(트레이스)"를 **손으로 세 도구를 오가며** 이어붙여야 했다. 
+
+### 핵심 개념 — observability 삼각형 (metrics / logs / traces)
+- **메트릭**: 숫자 시계열(요청량·에러율·지연·JVM). "**무언가 이상하다**"를 빨리 알아챈다
+- **로그**: 이벤트 텍스트. "**무슨 일이 났는지**"를 구체적으로 본다
+- **트레이스**: 한 요청의 서비스 간 경로/지연. "**어디서 느려졌/깨졌는지**"를 본다
+- 셋은 **서로를 보완**한다. 셋을 연결(메트릭→로그→트레이스)해야 분석이 한 흐름이 된다
+
+### 설계 결정
+- **수집은 pull, 코드는 무변경** Prometheus가 각 서비스의 `/actuator/prometheus`를 **긁어온다(pull)**. Zipkin이 span을 **받던(push)** 것과 방향이 반대. pull이라 **대상이 죽으면 `up=0`으로 그 사실 자체가 메트릭이 된다.** 서비스 코드는 한 줄도 안 바꿨다 — 이미 노출 중인 엔드포인트를 긁기만.
+- **전부 코드로 프로비저닝** Grafana datasource·대시보드를 **파일로** 박았다. 클릭 설정은 `down -v` 한 번에 사라지지만, 파일 프로비저닝은 **다시 올려도 동일하게 재현**된다(GitOps식). 대시보드는 Prometheus가 보장하는 **`job` 라벨**로 키를 잡아 서비스 추가에도 안 깨지게.
+- **지연 SLI를 위해 히스토그램을 켰다** 기본 `http.server.requests`는 count/sum/max만이라 **p95/p99를 못 구한다.** `percentiles-histogram` 을 켜 `_bucket` 시계열을 노출 → Grafana가 `histogram_quantile()`로 백분위 계산. (서비스당 application.yml 한 블록, Java 무변경)
+- **로그는 push, 트레이스와 연결** Loki("로그용 Prometheus") + Promtail. Promtail이 **도커 소켓**으로 모든 컨테이너 stdout을 tail해 Loki로 **push**(다시 pull과 대비). 핵심은 **derived field** — 5b가 로그에 박아둔 `[service,traceId,spanId]`에서 traceId를 정규식으로 뽑아 **Zipkin 트레이스로 점프하는 링크**를 만들었다. 메트릭(Grafana)→로그(Loki)→트레이스(Zipkin)가 **한 화면에서 연결**된다.
+
+### 무엇을 만들었나 
+- **1. Prometheus**: `monitoring/prometheus/prometheus.yml`(4개 서비스+자기 자신 scrape) + compose에 `prometheus`(depends_on 없음 = best-effort)
+- **2. Grafana**: datasource 프로비저닝(Prometheus, uid 고정) + 대시보드 provider + 대시보드 2종(Service Overview: up/요청량/에러율/p95·p99/CPU, JVM: 힙/논힙/GC/스레드/클래스) + 4개 서비스에 `percentiles-histogram` 활성화
+- **3. Loki+Promtail**: Loki 단일 바이너리 + Promtail(docker_sd로 컨테이너 로그 수집, `service` 라벨) + Grafana에 Loki(derivedField→Zipkin)·Zipkin 데이터소스 추가 + Logs 대시보드(로그량 그래프 + 로그 패널)
+
+### 직접 관찰한 것
+- **pull이 죽음을 잡는 순간**: `up` 쿼리로 4개 서비스 1 확인 → `docker compose stop product-service` → 15초(scrape 주기) 뒤 **product-service만 `up=0`**. 모니터링이 "죽었다"를 자동 인지
+- **지연 백분위가 그려짐**: 트래픽을 흘리니 Overview의 **p95/p99 패널이 채워짐** = 히스토그램 버킷이 실제로 노출됐다는 증거(`http_server_requests_seconds_bucket` 존재)
+- **재현성**: `docker compose down -v && up` 후에도 **3개 데이터소스 + 4개 대시보드가 그대로** 복원. 클릭이 아니라 코드라서
+- **삼각형 연결**: Loki 로그 한 줄을 펼쳐 **`TraceID` 링크 클릭 → Grafana 안에서 Zipkin 트레이스 워터폴**로 점프
+
+### 막힌 것 → 트러블슈팅
+- **TS-8**: 조각3에서 `datasource.yml`에 Loki를 추가했는데 대시보드에 `Datasource loki was not found`. 원인은 **Grafana는 프로비저닝을 부팅 시점에 한 번만 읽는데, 기존 grafana 컨테이너가 재생성되지 않아**(compose 출력이 `Recreated`가 아니라 `Running`) 새 설정을 못 읽은 것. `docker compose restart grafana`로 해결. **"설정 파일 교체 ≠ 프로세스 재적재"** 
+
+### 배운 것
+- **측정이 튜닝의 전제다.** "빨라졌다"는 숫자로 증명해야 한다 — 이 토대(6)가 있어야 7단계 Kafka 튜닝의 전후 비교가 가능하다.
+- **pull vs push는 트레이드오프다.** pull(Prometheus)은 대상 죽음을 자동 감지(`up`)하지만 대상 목록을 알아야 한다. push(Zipkin/Promtail)는 대상을 몰라도 되지만 죽음은 "안 들어옴"으로만 안다.
+- **observability는 코드여야 산다.** 클릭으로 만든 대시보드는 휘발된다. 프로비저닝으로 박아야 재현·리뷰·버전관리가 된다.
+- **세 신호의 가치는 연결에서 나온다.** 메트릭·로그·트레이스를 각각 가진 것보다, traceId로 셋을 잇는 한 줄(derived field)이 분석 흐름을 바꾼다.
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -741,6 +782,14 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 1. **쪼개는 순간 결합의 형태가 바뀐다.** 모놀리식의 in-process 호출이 → 네트워크 호출(실패 가능) → 메시지(비동기, 지연/불일치 가능)로. 매 단계가 **새로운 실패 모드**를 데려온다.
 2. **각 인프라 조각은 "직전의 고통"에 대한 답이다.** Kafka를 "좋아 보여서" 넣은 게 아니라, 동기 호출의 시간 결합이 아파서 넣었다. 이 순서를 지켜야 *왜* 필요한지가 몸에 남는다.
 3. **트레이드오프에 공짜가 없다.** 동기(일관성↑, 결합↑) ↔ 비동기(결합↓, 일관성↓). 어느 쪽도 정답이 아니고, **무엇을 포기할지 고르는 것**이 설계다.
-4. **관찰 가능성(observability)이 학습의 핵심 도구** probe, healthcheck, 로그(`[order] 발행 → [product] 수신`), consumer offset/lag — 이게 없었으면 "비동기가 됐다"를 *믿을* 수만 있고 *볼* 수는 없었다.
+4. **관찰 가능성(observability)이 학습의 핵심 도구** probe, healthcheck, 로그(`[order] 발행 → [product] 수신`), consumer offset/lag — 이게 없었으면 "비동기가 됐다"를 *믿을* 수만 있고 *볼* 수는 없었다. Step 6에서 이걸 메트릭·로그·트레이스 삼각형으로 제대로 깔았다.
 
 ---
+
+## 다음 — Step 7 예고 (Kafka 부하테스트 · 성능)
+
+Step 6으로 **측정 토대**가 생겼으니, 이제 "튜닝 전후를 숫자로 비교"할 수 있다. Step 7에서 다룰 것:
+- **부하 생성 + consumer lag 관측**(kafka-exporter 등) → 병목을 눈으로.
+- **파티션↑ + `@KafkaListener(concurrency)`** 로 처리량 확장. 핵심 학습: **파티션을 늘리면 순서 보장이 키(orderId) 단위로만** 좁아진다 → 사가 정합성에 어떤 영향이 있나.
+- producer 튜닝(`linger.ms`/`batch.size`/`compression`/`acks`)의 트레이드오프(지연↔처리량↔내구성).
+- 한계: 단일 브로커라 복제/ISR(내구성)은 못 본다 — 그건 인지만.

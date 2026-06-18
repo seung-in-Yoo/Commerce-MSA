@@ -1,0 +1,34 @@
+# Grafana 데이터소스 프로비저닝
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    # compose 네트워크 안에서 DNS(prometheus) + 컨테이너 내부 포트 9090
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: ",(\\w+),\\w+\\]"
+          url: "${__value.raw}"
+          datasourceUid: zipkin
+
+  - name: Zipkin
+    type: zipkin
+    uid: zipkin
+    access: proxy
+    url: http://zipkin:9411
+    editable: false
