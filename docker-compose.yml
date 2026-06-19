@@ -260,6 +260,19 @@ services:
     networks:
       - commerce-net
 
+  # Kafka consumer lag exporter
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    command:
+      - "--kafka.server=kafka:9092"   # 브로커에 DNS로 접속
+    ports:
+      - "${KAFKA_EXPORTER_PORT:-9308}:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - commerce-net
+
 volumes:
   order-db-data:
   product-db-data:
