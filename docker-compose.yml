@@ -31,6 +31,8 @@ services:
       PRODUCT_SERVICE_URL: http://product-service:8080
       # Kafka 브로커도 DNS로
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 부하테스트: payment-commands 파티션 수 (기본 1, 부하 재현 때 4 등으로 올림)
+      PAYMENT_COMMANDS_PARTITIONS: ${PAYMENT_COMMANDS_PARTITIONS:-1}
       # 분산추적 span을 보낼 Zipkin도 DNS로
       ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
