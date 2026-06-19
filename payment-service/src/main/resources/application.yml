@@ -43,6 +43,8 @@ spring:
 # 결제 승인 규칙: 금액이 한도를 넘으면 승인 거절(FAILED)
 payment:
   approval-limit: ${PAYMENT_APPROVAL_LIMIT:1000000}
+  # 부하실험용: 결제 처리당 인위적 지연(ms)
+  processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
 
 server:
   port: ${SERVER_PORT:8082}
