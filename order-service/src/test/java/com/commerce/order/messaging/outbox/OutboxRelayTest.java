@@ -23,6 +23,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -71,7 +72,23 @@ class OutboxRelayTest {
         }
 
         @Test
-        @DisplayName("성공 - PENDING이 없으면 아무것도 발행하지 않는다")
+        @DisplayName("성공 - 2건을 비동기로 발행한 뒤 flush를 한 번만 호출(배치)")
+        void batches_then_flushes_once() {
+            OutboxMessage m1 = OutboxMessage.create("payment-commands", "1", "{\"orderId\":1}", null);
+            OutboxMessage m2 = OutboxMessage.create("payment-commands", "2", "{\"orderId\":2}", null);
+            given(outboxRepository.findTop100ByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING))
+                    .willReturn(List.of(m1, m2));
+            given(outboxKafkaTemplate.send(anyString(), anyString(), anyString()))
+                    .willReturn(CompletableFuture.completedFuture((SendResult<String, String>) null));
+
+            outboxRelay.publishPending();
+
+            then(outboxKafkaTemplate).should(times(2)).send(anyString(), anyString(), anyString());
+            then(outboxKafkaTemplate).should(times(1)).flush();
+        }
+
+        @Test
+        @DisplayName("성공 - PENDING이 없으면 발행도 flush도 하지 않는다")
         void empty() {
             given(outboxRepository.findTop100ByStatusOrderByCreatedAtAsc(OutboxStatus.PENDING))
                     .willReturn(List.of());
@@ -79,6 +96,7 @@ class OutboxRelayTest {
             outboxRelay.publishPending();
 
             then(outboxKafkaTemplate).should(never()).send(anyString(), anyString(), anyString());
+            then(outboxKafkaTemplate).should(never()).flush();
         }
     }
 }
