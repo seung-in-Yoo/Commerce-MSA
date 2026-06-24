@@ -6,6 +6,7 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-10](#ts-10--k8s에서-product-service-crashloopbackoff--no-resolvable-bootstrap-urls) | 2026-06-24 | step8 | k8s 조각2에서 product-service가 `CrashLoopBackOff` — kafka Service 미배포라 `@KafkaListener` 컨슈머가 부팅 끝에 `kafka:9092` DNS resolve 실패(`No resolvable bootstrap urls`) |
 | [TS-9](#ts-9--커스텀-producerfactory에-native-producer-metric이-안-나온다) | 2026-06-24 | step7 | `actuator/prometheus`에 `kafka_producer_*`가 하나도 없음 — 커스텀 ProducerFactory엔 KafkaClientMetrics가 자동으로 안 붙음 |
 | [TS-8](#ts-8--grafana-datasource-loki-was-not-found--프로비저닝은-부팅-시-한-번만-읽는다) | 2026-06-18 | step6 | 대시보드에 `Datasource loki was not found` — datasource.yml에 Loki 추가했지만 grafana를 재기동 안 해 미반영 |
 | [TS-7](#ts-7--outboxstore-and-forward-경계가-분산추적-trace를-끊는다) | 2026-06-18 | step5b | Kafka 추적은 켰는데 사가가 한 trace로 안 묶임 — Outbox 릴레이가 다른 스레드/나중에 발행해 trace 단절 |
@@ -15,6 +16,91 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-10 — k8s에서 product-service `CrashLoopBackOff` (`No resolvable bootstrap urls`)
+
+- **날짜**: 2026-06-24
+- **단계**: step8 (쿠버네티스 — 조각2 product-service Deployment)
+
+### 증상
+
+조각1(product-db StatefulSet)이 `1/1 Running`인 상태에서 조각2로 product-service Deployment를 apply했더니
+파드가 뜨자마자 죽기를 반복했다:
+
+```
+$ kubectl get pods -n commerce
+NAME                               READY   STATUS             RESTARTS        AGE
+product-db-0                       1/1     Running            0               35m
+product-service-68cd499f8b-shmqz   0/1     CrashLoopBackOff   10 (4m11s ago)  31m
+```
+
+`kubectl logs --previous`의 마지막 stack:
+
+```
+Caused by: org.apache.kafka.common.KafkaException: Failed to construct kafka consumer
+  ... ClassicKafkaConsumer.<init> ...
+  ... KafkaMessageListenerContainer.doStart ...
+  ... KafkaListenerEndpointRegistry.start ...
+  ... DefaultLifecycleProcessor.doStart ...
+Caused by: org.apache.kafka.common.config.ConfigException:
+           No resolvable bootstrap urls given in bootstrap.servers
+```
+
+그 위에 비치명 ERROR도 한 줄 찍혀 있었다(아래 참고):
+
+```
+ERROR ... o.springframework.kafka.core.KafkaAdmin : Could not create admin
+Caused by: ... ConfigException: No resolvable bootstrap urls ...
+```
+
+### 원인 — compose가 숨겨준 결합이 k8s에서 터졌다
+
+- product-service의 `StockCommandListener`는 `@KafkaListener(topics = "stock-commands")` 컨슈머다.
+- 스프링 부팅 **마지막 단계**에서 `KafkaListenerEndpointRegistry`(SmartLifecycle)가 이 리스너 컨테이너를 `start` → 컨슈머를 **생성**하면서 `bootstrap.servers = kafka:9092`를 **DNS resolve** 시도한다.
+- 그런데 조각2 시점의 클러스터엔 **`kafka` Service가 아직 없다**(kafka는 뒤 조각에서 배포). DNS 자체가 없어 `No resolvable bootstrap urls` → 컨슈머 생성 실패 → **context refresh 실패** → 프로세스 종료 → `CrashLoopBackOff`.
+- **왜 compose에선 안 터졌나**: docker-compose에선 kafka 컨테이너가 늘 떠 있어 `kafka:9092` DNS가 항상 resolve됐다. "앱이 kafka에 부팅 시점부터 묶여 있다"는 **결합을 compose가 가려줬던** 것 — k8s로 옮겨 의존 Service를 하나씩 세우니 그제서야 드러났다.
+- **흔한 오해 정정**: "readiness 그룹에 kafka가 없으니 브로커가 없어도 앱은 뜨고 컨슈머만 백그라운드 재시도한다"는 *브로커만 죽고 DNS는 되는* 경우에만 참이다. 지금은 **DNS 자체가 불가**라 컨슈머 생성 단계에서 hard fail — 결이 다르다.
+- **앞의 `KafkaAdmin: Could not create admin` ERROR는 범인이 아니다.** `KafkaAdmin`은 `fatalIfBrokerNotAvailable` 기본값이 `false`라, 같은 DNS 실패를 만나도 **로그만 찍고 context를 죽이지 않는다.** 실제 킬러는 그 뒤의 **리스너 컨테이너 start**다(stack의 `KafkaListenerEndpointRegistry.start`로 확인).
+
+### 해결 — 조각2 한정으로 리스너 자동 기동을 끈다
+
+ConfigMap(`product-service-config`)에 한 줄 추가:
+
+```yaml
+data:
+  # ...
+  # 조각2 한정: kafka Service가 아직 없으므로 @KafkaListener를 자동 기동하지 않는다.
+  SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"
+```
+
+`spring.kafka.listener.auto-startup=false`(env relaxed-binding)가 되면 `KafkaListenerEndpointRegistry`가
+리스너 컨테이너를 **start하지 않는다 → 컨슈머를 아예 생성 안 함 → DNS resolve 자체가 없음 → 부팅 성공.**
+(`StockCommandListener`는 커스텀 `containerFactory` 없이 디폴트 팩토리를 쓰므로 이 전역 설정이 그대로 먹는다.)
+
+적용 후:
+
+```
+$ kubectl rollout restart deployment/product-service -n commerce
+$ kubectl get pods -n commerce -l app=product-service
+NAME                               READY   STATUS    RESTARTS   AGE
+product-service-67d7447bb6-z75ds   1/1     Running   0          24s
+
+# Started ProductApplication in 2.112 seconds
+# readiness: {"status":"UP","components":{"db":{"status":"UP"...},"readinessState":{"status":"UP"}}}
+```
+
+`Failed to construct kafka consumer`는 사라졌고, 비치명 `KafkaAdmin: Could not create admin` ERROR 한 줄만 남는다(정상 — 안 죽임).
+
+> **조각2는 "앱1 + DB1"로 유지**하는 게 이 단계의 목적이다. kafka를 배포하는 뒤 조각에서 이 줄을 제거(또는 `"true"`)해 컨슈머를 되살린다.
+
+### 교훈
+
+- **compose는 "전부 한 네트워크에 늘 떠 있음" 덕분에 부팅 시점 의존성을 가려준다.** k8s로 옮겨 Service를 한 조각씩 세우면, 숨어 있던 *부팅 순서/하드 의존*이 그대로 드러난다 — 이게 §13 "동기 결합을 직접 겪는다"의 인프라 버전.
+- **같은 예외 메시지(`No resolvable bootstrap urls`)라도 "로그만 찍는 곳"과 "context를 죽이는 곳"이 다르다.** `KafkaAdmin`(비치명) vs 리스너 컨테이너 start(치명)를 stack으로 구분해야 진짜 범인을 잡는다. ERROR 레벨이라고 다 기동 실패의 원인은 아니다.
+- **부팅 시점 외부 의존을 줄이는 안전장치 = `auto-startup: false`.** 의존 인프라가 아직 없거나 느린 환경에서 리스너를 늦게 켜는 건 흔한 운영 패턴(이후 `KafkaListenerEndpointRegistry`로 런타임에 start 가능).
+- TS-8 교훈("설정 파일 교체 ≠ 프로세스 재적재")과 짝 — ConfigMap을 바꿔도 파드는 자동으로 다시 안 읽으므로 `rollout restart`로 새 파드를 띄워야 반영된다.
 
 ---
 
