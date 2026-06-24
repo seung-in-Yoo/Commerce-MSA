@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: product-service-config
+  namespace: commerce
+data:
+  SERVER_PORT: "8080"
+  SPRING_DATASOURCE_URL: "jdbc:mysql://product-db:3306/product?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  ZIPKIN_ENDPOINT: "http://zipkin:9411/api/v2/spans"
+  # kafka를 배포하는 조각에서 이 줄을 제거또는 "true"로 다시 컨슈머를 살림
+  SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"
