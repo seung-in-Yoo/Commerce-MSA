@@ -2,6 +2,7 @@ package com.commerce.order.global.config;
 
 import com.commerce.order.messaging.SagaTopics;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
@@ -9,12 +10,19 @@ import org.springframework.kafka.config.TopicBuilder;
 @Configuration
 public class KafkaTopicConfig {
 
-    // 오케스트레이션 채널 5개
-    // 같은 주문의 메시지들이 순서를 지키도록 파티션은 1개
+    // payment-commands(병목 토픽)의 파티션 수 = 병렬 처리 차선 수
+    // 기본 1 -> 부하실험 때만 늘린다(ex: 4)
+    private final int paymentCommandsPartitions;
+
+    public KafkaTopicConfig(
+            @Value("${saga.payment-commands.partitions:1}") int paymentCommandsPartitions) {
+        this.paymentCommandsPartitions = paymentCommandsPartitions;
+    }
+
     @Bean
     public NewTopic paymentCommandsTopic() {
         return TopicBuilder.name(SagaTopics.PAYMENT_COMMANDS)
-                .partitions(1)
+                .partitions(paymentCommandsPartitions)
                 .replicas(1)
                 .build();
     }

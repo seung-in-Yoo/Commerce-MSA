@@ -1,0 +1,108 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["commerce-msa", "kafka"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Commerce MSA — Kafka / Consumer Lag",
+  "uid": "commerce-kafka",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Consumer Lag by group (총 lag — 우상향이면 병목)",
+      "description": "컨슈머그룹별 처리 못 한 메시지 총합. 우상향하면 유입 > 처리 = 그 컨슈머가 병목.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 15, "showPoints": "never", "lineWidth": 2 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (consumergroup) (kafka_consumergroup_lag)", "legendFormat": "{{consumergroup}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Consumer Lag by topic",
+      "description": "토픽별 lag. 어느 토픽(=어느 사가 단계)에서 쌓이는지 확인.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (topic) (kafka_consumergroup_lag)", "legendFormat": "{{topic}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Topic Partitions (조각3에서 늘림)",
+      "description": "토픽별 파티션 수. 조각3에서 늘리면 이 값이 올라간다.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "kafka_topic_partitions{topic!~\"__.*\"}", "legendFormat": "{{topic}}", "instant": true }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Message in-rate per topic (유입 속도, msg/s)",
+      "description": "토픽으로 들어오는 메시지 속도. 부하를 주면 올라간다 (producer 쪽).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m]))", "legendFormat": "{{topic}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Consume-rate per group (처리 속도, msg/s)",
+      "description": "컨슈머그룹이 처리하는 속도. 유입속도보다 낮으면 lag이 쌓인다. 조각4(concurrency)로 이걸 끌어올린다.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (consumergroup) (rate(kafka_consumergroup_current_offset{topic!~\"__.*\"}[1m]))", "legendFormat": "{{consumergroup}}" }
+      ]
+    }
+  ]
+}

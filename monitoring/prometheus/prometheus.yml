@@ -26,6 +26,11 @@ scrape_configs:
     static_configs:
       - targets: ['gateway-service:8080']
 
+  # Kafka consumer lag exporter
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
   # Prometheus 메트릭 노출
   - job_name: 'prometheus'
     static_configs:

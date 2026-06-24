@@ -775,6 +775,82 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
+## Step 7 — Kafka 부하테스트 · 성능 (진행중)
+
+> 확장 트랙(Phase 1.5)의 둘째. Step 6의 측정 토대 위에서 **"부하를 줘 병목을 만들고, 설정으로 잡는다".** 조각: ① lag 관측 → ② 부하·병목 재현 → ③ 파티션↑ → ④ concurrency → ⑤ producer 튜닝.
+
+### 직전의 고통
+지금까지 사가는 **"한 건이 잘 도는지(기능 정합성)"** 만 봤지, **부하 하에서 어디가 먼저 무너지는지(병목)** 는 한 번도 안 봤다. Step 6에서 메트릭·로그·트레이스을 달았지만 평상시 트래픽이라 그래프가 평평했다 
+
+### 핵심 개념 — consumer lag
+`lag = (토픽 끝 offset, LEO) − (컨슈머가 커밋한 offset)` = **"아직 처리 못 한 메시지 수"**.
+- `lag 0` = 들어오는 족족 처리(여유). **`lag` 우상향 = 유입 > 처리 = 병목.**
+- 부하테스트의 목표 = **"우상향하는 lag을 평평/0으로 만드는 설정을 찾는 것"**. 
+
+### 설계 결정
+- **lag을 보는 "눈"부터(조각1).** 브로커는 lag을 Prometheus 형태로 안 내보낸다 → `kafka-exporter`(사이드카)가 offset을 물어 `kafka_consumergroup_lag` 등으로 변환. Grafana 신규 대시보드(`commerce-kafka`)로 lag·파티션·유입율·처리율을 시각화. **부하 주기 전에 눈부터.**
+- **부하는 k6, 고정 RPS(조각2).** `constant-arrival-rate`로 "초당 N건"을 직접 통제 → 유입속도와 처리속도의 격차를 패널에서 1:1로 본다. order 직접(:8080)으로 변수 최소화.
+- **병목을 "재현"해야 측정할 게 생긴다.** 1차 부하(200RPS)에선 lag이 안 쌓였다 — 우리 결제가 **비현실적으로 빨라서**(1ms 미만). 현실의 결제(외부 PG 승인)는 수십~수백 ms. 그래서 payment 컨슈머에 **환경변수로 제어하는 인위적 처리지연**(`ProcessingDelay`, 기본 0)을 주입해 현실을 모사 → 단일 컨슈머의 처리 천장을 낮춰 병목을 재현.
+
+### 무엇을 만들었나
+- **조각1**: `kafka-exporter`(compose, danielqsj v1.8.0, :9308) + `prometheus.yml` scrape job + Grafana `commerce-kafka.json`(lag/파티션/유입·처리율 5패널)
+- **조각2**: k6 부하스크립트 `loadtest/scripts/order-load.js`(고정 RPS, `-e RATE/DURATION`) + payment `ProcessingDelay`(env `PAYMENT_PROCESSING_DELAY_MS`, 기본 0=무영향)
+
+### 직접 관찰한 것 
+- **1차 (지연 0, 200 RPS) — 병목 미발생.** lag이 최대 45까지 찰랑이다 부하 끝나니 **0 복귀**. 처리 ≥ 유입, p95 7ms. = "이 부하론 여유" + **"병목 관찰엔 처리비용이 부족하다"** 는 진단.
+- **2차 (지연 50ms, 50 RPS) — 병목 재현 성공.** 처리 천장 `= 1000ms / 50ms = 20/s`, 유입 `50/s` → 매초 **+30 누적**. `payment-commands` lag이 **언덕 모양으로 우상향, 최대 ≈ 3.13k**. 부하 종료 후 20/s씩 천천히 감소(밀린 백로그 소화). order/product lag은 거의 0 (payment가 throttle 지점).
+- **주문 접수는 내내 빨랐다(p95 5ms).** 병목은 동기 응답이 아니라 **비동기 컨슈머 뒤에 숨는다** — lag 관측이 없었으면 "겉보기 멀쩡"으로 놓쳤을 것.
+
+### 메시지 키 = orderId (파티션 안전성의 근거)
+조각3(파티션↑) 착수 전 확인: `payment-commands`는 **`orderId`를 키로 발행**된다(`SagaCommandPublisher` → Outbox → `OutboxRelay`까지 키 보존). 파티션을 늘려도 `hash(orderId) % N`으로 **같은 주문은 항상 같은 파티션 → 키 단위 순서 보장 → 사가 안전**.
+
+### 배운 것 (조각1·2 시점)
+- **병목은 "만들어야" 보인다.** 정상 동작하는 시스템에 부하만 준다고 병목이 나오지 않는다. **처리 비용이 현실적이어야(또는 부하가 충분히 커야)** 천장이 드러난다.
+- **비동기는 병목을 숨긴다.** 동기였으면 p95·503으로 즉시 드러날 부하가, 비동기에선 컨슈머 lag으로 **뒤에** 쌓인다. 그래서 lag 관측이 필수.
+- **lag의 기울기 = 유입 − 처리.** 천장(처리율)을 숫자로 알면 어느 부하에서 무너질지 예측되고, 튜닝 목표(**천장을 유입 위로 올리기**)가 명확해진다.
+
+### 조각3 — 파티션↑ 
+- **무엇을**: `payment-commands`의 파티션 수를 env로 변수화. order `KafkaTopicConfig`(`PAYMENT_COMMANDS_PARTITIONS`, 기본 1=평소 무영향)만 변수, 나머지 토픽은 1 유지. `.env`에서 **4로 켜고** 재기동 → KafkaAdmin이 기동 시 파티션을 1→4로 자동 증가(증가만 가능, 감소 불가)
+- **왜 파티션인가**: 파티션 = 토픽을 쪼갠 **병렬 처리 단위 = "일꾼이 앉을 자리 수"**. 1개면 같은 컨슈머 그룹에서 **일꾼(스레드)도 무조건 1명**. 그래서 조각2의 천장 20/s가 고정됐던 것. 자리를 4개로 늘려 일꾼 4명이 붙을 *여지*를 만든다
+- **직접 관찰 — lag 여전히 ≈ 4.09k 우상향(함정 확인).** 파티션만 4로 늘리고 payment `@KafkaListener` **concurrency=1**이면 → **1스레드가 4파티션을 혼자 다 읽어** 결국 50ms씩 순차 처리. 천장 20/s 그대로 → lag 안 줄어듦. **"자리만 늘리고 일꾼은 그대로"** 를 눈으로 확인. 이게 조각4의 동기
+
+### 조각4 — concurrency로 천장 돌파
+- **무엇을**: payment `KafkaConsumerConfig`의 **process 팩토리에만** `factory.setConcurrency(...)` 주입(env `PAYMENT_COMMANDS_CONCURRENCY`, 기본 1). 환불 팩토리는 1 유지. `.env`에서 **4로**
+- **핵심 규칙**: **한 파티션 = 한 컨슈머 스레드**(같은 그룹 내). concurrency는 파티션 수와 **1:1로** 맞춰야 의미. 스레드 > 파티션이면 초과분은 **유휴**(파티션을 못 받음)
+- **직접 관찰 — 병목 해소.** 처리 천장 `= 1000ms / 50ms × 4스레드 = 80/s` > 유입 50/s. lag이 **언덕(≈4k) → 최대 45, 평탄**(사실상 0). 부하 중에도 안 쌓인다
+- **로그로 못 박음**: 파티션 배정이 **4개 스레드(`...ntainer#0-0-C-1`~`#0-3-C-1`)에 `payment-commands-0~3` 1:1**로 나뉘어 찍힘. 조각3에선 한 스레드가 `[-0,-1,-2,-3]`을 다 들고 있었다. 환불 토픽은 의도대로 1스레드 유지
+
+### 배운 것 (조각3·4 시점)
+- **파티션은 "병렬의 상한", concurrency는 "실제 일꾼 수". 둘 다 올려야 효과.** 파티션만↑(조각3)은 자리만 늘린 빈 의자 — 처리량 0 변화. 둘을 1:1로 맞췄을 때(조각4) 비로소 천장이 4배로
+- **튜닝 목표를 숫자로**: 천장 = `1000ms / 처리시간 × 스레드`. 유입 위로 올리면 lag이 평탄. baseline(20/s)→해소(80/s)가 그래프로 깔끔히 보였다
+- **순서 안전은 키가 지킨다(조각3 사전확인의 회수).** 파티션 4개로 흩어져도 `hash(orderId)`로 같은 주문은 같은 파티션 → 키 단위 순서 보장. 그래서 병렬화가 사가를 안 깬다
+
+### 조각5 — producer 튜닝 (linger.ms / batch.size / compression / acks)
+- **무엇을**: 두 가지. `KafkaProducerConfig`에 `acks`/`linger.ms`/`batch.size`/`compression.type` 4종을 env화(`outbox.producer.*`, 기본=Kafka 기본값=무영향), **`OutboxRelay`를 "한 건 `send()` → 즉시 `.get()`으로 ack 대기" 반복에서 → "PENDING 100건 전부 비동기 `send()` → `flush()` 한 번 → 도착 확인 후 `markSent`" 배치로 리팩터.** 동기 .get()-per-message 구조에선 producer 버퍼에 한 번에 한 건뿐이라 `batch.size`/`linger.ms`가 묶을 게 없다 — **배치를 살리려면 설정 이전에 발행 패턴부터 비동기 다발 → flush여야 한다**
+- **계측 함정(→ TS-9)**: 부하 주기 전 `actuator/prometheus`에 `kafka_producer_*` native metric이 **하나도 안 나왔다**. 원인은 우리가 `DefaultKafkaProducerFactory`를 **직접 `new`** 해서 — Spring Boot가 자동 구성하는 factory엔 `KafkaClientMetrics`가 자동으로 붙지만, 커스텀 factory엔 안 붙는다. `producerFactory.addListener(new MicrometerProducerListener<>(meterRegistry))`를 직접 등록해 해결. **"커스텀 빈을 직접 만들면 자동 계측도 같이 잃는다"**
+- **직접 관찰 — A/B 비교(같은 부하 50RPS·90s, payment delay=50ms)**:
+
+  | 지표 | Run B baseline<br>(linger=0/batch=16K/none) | Run A 튜닝 ON<br>(linger=20/batch=64K/lz4) | 의미 |
+  |---|---|---|---|
+  | `records_per_request_avg` | 16.2 | **99.1** | 한 produce 요청에 묶이는 레코드 6배 ↑ |
+  | `batch_size_avg` | 828 B | 2116 B | 배치 2.5배 ↑ |
+  | `request_rate` | 3.71/s | **0.91/s** | produce 요청 횟수 ¼로 ↓(네트워크 왕복 절감) |
+  | `compression_rate_avg` | 1.0 (압축 X) | **0.613** | lz4가 ~39% 압축 |
+  | `record_send_total` | 9004 | 9004 | 동일 부하량(대조군 검증) |
+
+- **반전 — 코드 추론을 실측이 정정했다.** 관찰 전엔 "릴레이가 `flush()`를 부르니 `linger.ms`는 무시되고 설정은 무용지물, 배치는 순전히 1초 폴링 구조가 만든다"고 추론했다. **틀렸다.** `linger=20`+`batch=64K`로 올리니 요청당 묶음이 16→99로 6배, 요청 횟수가 ¼이 됐다. 이유: `flush()`가 sender를 즉시 깨우는 건 맞지만, **100건을 for문으로 빠르게 `send()`하는 그 짧은 구간** 동안 `batch.size`가 작으면 배치가 일찍 꽉 차 잘게 쪼개져 나가고 `linger=0`이면 즉시 전송된다. batch가 크고 linger가 있으면 같은 100건이 **더 적은 수의 큰 배치**로 묶인다. **flush가 있어도 linger/batch.size는 "한 폴링 사이클 안의 묶음 단위"에 실제로 영향을 준다.**
+
+### 배운 것 (조각5 시점)
+- **배치는 발행 패턴이 먼저, 설정이 그 다음.** 동기 .get()-per-message였다면 버퍼에 한 건뿐이라 어떤 설정도 안 묶인다. 비동기 send→flush로 패턴을 바꾼 뒤에야 `linger`/`batch.size`가 묶음 단위를 키우는 레버로 작동했다
+- **compression은 별도 축.** 묶음 수(`records_per_request`)와 무관하게 전송 바이트만 줄인다(lz4 → 0.61). 묶음↑(네트워크 왕복↓)과 압축(대역폭↓)은 다른 이득
+- **정직한 한계 ①**: 이 producer 효율 개선은 **consumer lag을 줄이지 않는다.** 우리 병목은 consumer 처리(50ms)였고 조각4(concurrency)에서 이미 해소했다. producer 튜닝은 **발행측 효율**(왕복·대역폭) 개선이지 end-to-end 처리량 천장(=consumer)을 올리는 게 아니다 — 메커니즘 체득이 목적
+- **정직한 한계 ②**: 단일 브로커라 `acks=all ≈ acks=1`(ISR=리더 자신뿐). 복제/내구성 트레이드오프는 못 봤다 — 인지만
+
+### 진행 상태
+조각1~5 완료 = **Step 7 마무리.** **병목 재현(≈4k 우상향) → 파티션만으론 미해소(함정) → concurrency 1:1로 천장 4배(lag 평탄) → producer 배치/압축 튜닝(요청당 묶음 6배·요청 ¼·압축 39%, A/B로 확인)** 까지 관찰. 핵심 루프(파티션 ↔ concurrency ↔ producer 배치)를 코드와 숫자로 다 돌았다. 다음: **Step 8 — 쿠버네티스(로컬 kind/k3d).**
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:
@@ -786,10 +862,8 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
-## 다음 — Step 7 예고 (Kafka 부하테스트 · 성능)
+## 다음 — Step 7 잔여 + Step 8 예고
 
-Step 6으로 **측정 토대**가 생겼으니, 이제 "튜닝 전후를 숫자로 비교"할 수 있다. Step 7에서 다룰 것:
-- **부하 생성 + consumer lag 관측**(kafka-exporter 등) → 병목을 눈으로.
-- **파티션↑ + `@KafkaListener(concurrency)`** 로 처리량 확장. 핵심 학습: **파티션을 늘리면 순서 보장이 키(orderId) 단위로만** 좁아진다 → 사가 정합성에 어떤 영향이 있나.
-- producer 튜닝(`linger.ms`/`batch.size`/`compression`/`acks`)의 트레이드오프(지연↔처리량↔내구성).
-- 한계: 단일 브로커라 복제/ISR(내구성)은 못 본다 — 그건 인지만.
+**Step 7 잔여(조각3~5):** 파티션↑로 병렬 차선을 늘리고(단 컨슈머 스레드 1이면 효과 없음을 관찰) → `@KafkaListener(concurrency)`로 처리 천장 돌파 → producer 튜닝(`linger.ms`/`batch.size`/`compression`/`acks`)의 트레이드오프(지연↔처리량↔내구성). 한계: 단일 브로커라 복제/ISR(내구성)은 못 본다 — 인지만.
+
+**Step 8 예고(쿠버네티스):** 로컬 kind/k3d로 compose → Deployment/Service/ConfigMap/Secret, MySQL·Kafka는 StatefulSet+PVC, **actuator probe → k8s probe(§4 복선 회수)**, 게이트웨이 → Ingress, HPA.

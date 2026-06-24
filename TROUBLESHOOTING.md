@@ -6,6 +6,7 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-9](#ts-9--커스텀-producerfactory에-native-producer-metric이-안-나온다) | 2026-06-24 | step7 | `actuator/prometheus`에 `kafka_producer_*`가 하나도 없음 — 커스텀 ProducerFactory엔 KafkaClientMetrics가 자동으로 안 붙음 |
 | [TS-8](#ts-8--grafana-datasource-loki-was-not-found--프로비저닝은-부팅-시-한-번만-읽는다) | 2026-06-18 | step6 | 대시보드에 `Datasource loki was not found` — datasource.yml에 Loki 추가했지만 grafana를 재기동 안 해 미반영 |
 | [TS-7](#ts-7--outboxstore-and-forward-경계가-분산추적-trace를-끊는다) | 2026-06-18 | step5b | Kafka 추적은 켰는데 사가가 한 trace로 안 묶임 — Outbox 릴레이가 다른 스레드/나중에 발행해 trace 단절 |
 | [TS-6](#ts-6--게이트웨이reactive-로그에-traceid가-안-찍힌다) | 2026-06-18 | step5b | reactive 게이트웨이 로그의 traceId 빈칸 — context를 조립 시점에 읽음 + 자동 컨텍스트 전파 미활성 |
@@ -14,6 +15,50 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-9 — 커스텀 ProducerFactory에 native producer metric이 안 나온다
+
+- **날짜**: 2026-06-24
+- **단계**: step7 (Kafka 성능 — 조각5 producer 튜닝 A/B 관찰)
+
+### 증상
+
+조각5 producer 튜닝(`linger.ms`/`batch.size`/`compression`) 효과를 보려고 부하 전
+order-service `actuator/prometheus`에서 producer 지표를 찾았는데 **하나도 없었다**:
+
+```
+$ curl -s localhost:8080/actuator/prometheus | grep '^kafka_producer'
+(빈 결과)
+```
+
+`spring_kafka_template_*`(Spring 관측 metric)은 있는데, 정작 보려던
+`kafka_producer_batch_size_avg` / `compression_rate_avg` / `records_per_request_avg` 같은
+**Kafka 클라이언트 native metric**은 전부 없었다.
+
+### 원인 — 커스텀 factory엔 KafkaClientMetrics 자동 바인딩이 안 붙는다
+
+- Spring Boot가 **자동 구성**하는 `ProducerFactory`에는 `KafkaClientMetrics`가 자동으로 연결돼 native client metric이 노출된다.
+- 그런데 우리는 `KafkaProducerConfig`에서 튜닝 옵션을 직접 넣으려고 **`DefaultKafkaProducerFactory`를 직접 `new`** 했다.
+  → auto-config 경로를 벗어나면서 **client metric 자동 바인딩도 같이 잃은** 것.
+- kafka-exporter는 broker 쪽 consumer lag만 본다 — producer 배치/압축은 **client-side metric**이라 거기에도 안 잡힌다.
+
+### 해결 — MicrometerProducerListener를 직접 등록
+
+```java
+DefaultKafkaProducerFactory<String, String> producerFactory = new DefaultKafkaProducerFactory<>(props);
+producerFactory.addListener(new MicrometerProducerListener<>(meterRegistry)); // ← 직접 등록
+```
+
+빈 시그니처에 `MeterRegistry`를 주입받아 넘긴다. 재기동 후 첫 발행이 일어나면
+`kafka_producer_*` 87종이 노출되고, A/B 관찰(`records_per_request_avg` 16→99 등)이 가능해졌다.
+
+### 교훈
+
+- **커스텀 빈을 직접 만들면 자동 구성이 얹어주던 부가 기능(여기선 계측)도 같이 사라진다.** "왜 자동으로 되던 게 안 되지"의 절반은 auto-config 경로를 벗어난 탓.
+- **metric은 첫 사용 시점에 등록된다.** producer가 한 번도 send하지 않으면 `kafka_producer_*`가 아예 안 보인다 — "metric 없음"을 "계측 실패"로 오인하지 말 것(워밍업 1건 발행 후 재확인).
+- producer(client-side) 지표와 broker-side(exporter) 지표는 **수집 경로가 다르다.** lag은 exporter, 배치/압축은 client metric.
 
 ---
 

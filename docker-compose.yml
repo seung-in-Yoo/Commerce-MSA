@@ -31,6 +31,13 @@ services:
       PRODUCT_SERVICE_URL: http://product-service:8080
       # Kafka 브로커도 DNS로
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # 부하테스트: payment-commands 파티션 수 (기본 1, 부하 재현 때 4 등으로 올림)
+      PAYMENT_COMMANDS_PARTITIONS: ${PAYMENT_COMMANDS_PARTITIONS:-1}
+      # producer 튜닝: outbox 릴레이 발행측 설정
+      OUTBOX_PRODUCER_ACKS: ${OUTBOX_PRODUCER_ACKS:-all}
+      OUTBOX_PRODUCER_LINGER_MS: ${OUTBOX_PRODUCER_LINGER_MS:-0}
+      OUTBOX_PRODUCER_BATCH_SIZE: ${OUTBOX_PRODUCER_BATCH_SIZE:-16384}
+      OUTBOX_PRODUCER_COMPRESSION_TYPE: ${OUTBOX_PRODUCER_COMPRESSION_TYPE:-none}
       # 분산추적 span을 보낼 Zipkin도 DNS로
       ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
@@ -128,6 +135,10 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       # 결제 승인 한도
       PAYMENT_APPROVAL_LIMIT: ${PAYMENT_APPROVAL_LIMIT:-1000000}
+      # 부하실험: 결제 처리당 인위적 지연(ms)
+      PAYMENT_PROCESSING_DELAY_MS: ${PAYMENT_PROCESSING_DELAY_MS:-0}
+      # 부하실험: payment-commands 리스너 컨슈머 스레드 수(파티션과 1:1), 기본 1
+      PAYMENT_COMMANDS_CONCURRENCY: ${PAYMENT_COMMANDS_CONCURRENCY:-1}
       ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
     ports:
       - "${PAYMENT_SERVICE_PORT}:8080"
@@ -257,6 +268,19 @@ services:
       timeout: 10s
       retries: 15
       start_period: 30s
+    networks:
+      - commerce-net
+
+  # Kafka consumer lag exporter
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    command:
+      - "--kafka.server=kafka:9092"   # 브로커에 DNS로 접속
+    ports:
+      - "${KAFKA_EXPORTER_PORT:-9308}:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
     networks:
       - commerce-net
 

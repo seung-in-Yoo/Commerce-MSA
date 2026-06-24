@@ -23,6 +23,7 @@ public class PaymentCommandListener {
     private final PaymentService paymentService;
     private final PaymentReplyPublisher paymentReplyPublisher;
     private final ProcessedMessageRepository processedMessageRepository;
+    private final ProcessingDelay processingDelay;
 
     // payment가 두 command 타입(결제/환불)을 구독하므로 타입별 전용 팩토리 지정
     // 결제 저장과 inbox 기록(ProcessedMessage)을 한 트랜잭션으로 묶음
@@ -38,6 +39,10 @@ public class PaymentCommandListener {
                     command.messageId(), command.orderId());
             return;
         }
+
+        // 병목 재현 -> 현실적인 결제 처리시간(외부 PG 승인 등) 인위적 지연
+        // 기본값 0이라 평소엔 무영향 -> 부하실험 때만 PAYMENT_PROCESSING_DELAY_MS로 켠다
+        processingDelay.apply();
 
         PaymentResponse payment = paymentService.pay(command.orderId(), command.amount());
         processedMessageRepository.save(ProcessedMessage.of(command.messageId()));

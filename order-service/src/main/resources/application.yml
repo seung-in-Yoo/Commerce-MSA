@@ -48,6 +48,19 @@ product:
   service:
     url: ${PRODUCT_SERVICE_URL:http://localhost:8081}
 
+# 부하테스트: payment-commands 파티션 수 (기본 1, 부하 재현 때 4 등으로 올림)
+saga:
+  payment-commands:
+    partitions: ${PAYMENT_COMMANDS_PARTITIONS:1}
+
+# producer 튜닝: outbox 릴레이 전용 producer 설정
+outbox:
+  producer:
+    acks: ${OUTBOX_PRODUCER_ACKS:all}
+    linger-ms: ${OUTBOX_PRODUCER_LINGER_MS:0}
+    batch-size: ${OUTBOX_PRODUCER_BATCH_SIZE:16384}
+    compression-type: ${OUTBOX_PRODUCER_COMPRESSION_TYPE:none}
+
 management:
   # 분산추적: 모든 hop에 trace id 전파 -> Zipkin으로 전송
   tracing:
