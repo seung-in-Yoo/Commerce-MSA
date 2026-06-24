@@ -42,6 +42,9 @@ class PaymentCommandListenerTest {
     @Mock
     private ProcessedMessageRepository processedMessageRepository;
 
+    @Mock
+    private ProcessingDelay processingDelay;
+
     @Nested
     @DisplayName("onProcessPayment")
     class OnProcessPayment {
