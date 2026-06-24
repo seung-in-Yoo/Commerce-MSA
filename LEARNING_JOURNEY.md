@@ -825,8 +825,29 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 - **튜닝 목표를 숫자로**: 천장 = `1000ms / 처리시간 × 스레드`. 유입 위로 올리면 lag이 평탄. baseline(20/s)→해소(80/s)가 그래프로 깔끔히 보였다
 - **순서 안전은 키가 지킨다(조각3 사전확인의 회수).** 파티션 4개로 흩어져도 `hash(orderId)`로 같은 주문은 같은 파티션 → 키 단위 순서 보장. 그래서 병렬화가 사가를 안 깬다
 
+### 조각5 — producer 튜닝 (linger.ms / batch.size / compression / acks)
+- **무엇을**: 두 가지. `KafkaProducerConfig`에 `acks`/`linger.ms`/`batch.size`/`compression.type` 4종을 env화(`outbox.producer.*`, 기본=Kafka 기본값=무영향), **`OutboxRelay`를 "한 건 `send()` → 즉시 `.get()`으로 ack 대기" 반복에서 → "PENDING 100건 전부 비동기 `send()` → `flush()` 한 번 → 도착 확인 후 `markSent`" 배치로 리팩터.** 동기 .get()-per-message 구조에선 producer 버퍼에 한 번에 한 건뿐이라 `batch.size`/`linger.ms`가 묶을 게 없다 — **배치를 살리려면 설정 이전에 발행 패턴부터 비동기 다발 → flush여야 한다**
+- **계측 함정(→ TS-9)**: 부하 주기 전 `actuator/prometheus`에 `kafka_producer_*` native metric이 **하나도 안 나왔다**. 원인은 우리가 `DefaultKafkaProducerFactory`를 **직접 `new`** 해서 — Spring Boot가 자동 구성하는 factory엔 `KafkaClientMetrics`가 자동으로 붙지만, 커스텀 factory엔 안 붙는다. `producerFactory.addListener(new MicrometerProducerListener<>(meterRegistry))`를 직접 등록해 해결. **"커스텀 빈을 직접 만들면 자동 계측도 같이 잃는다"**
+- **직접 관찰 — A/B 비교(같은 부하 50RPS·90s, payment delay=50ms)**:
+
+  | 지표 | Run B baseline<br>(linger=0/batch=16K/none) | Run A 튜닝 ON<br>(linger=20/batch=64K/lz4) | 의미 |
+  |---|---|---|---|
+  | `records_per_request_avg` | 16.2 | **99.1** | 한 produce 요청에 묶이는 레코드 6배 ↑ |
+  | `batch_size_avg` | 828 B | 2116 B | 배치 2.5배 ↑ |
+  | `request_rate` | 3.71/s | **0.91/s** | produce 요청 횟수 ¼로 ↓(네트워크 왕복 절감) |
+  | `compression_rate_avg` | 1.0 (압축 X) | **0.613** | lz4가 ~39% 압축 |
+  | `record_send_total` | 9004 | 9004 | 동일 부하량(대조군 검증) |
+
+- **반전 — 코드 추론을 실측이 정정했다.** 관찰 전엔 "릴레이가 `flush()`를 부르니 `linger.ms`는 무시되고 설정은 무용지물, 배치는 순전히 1초 폴링 구조가 만든다"고 추론했다. **틀렸다.** `linger=20`+`batch=64K`로 올리니 요청당 묶음이 16→99로 6배, 요청 횟수가 ¼이 됐다. 이유: `flush()`가 sender를 즉시 깨우는 건 맞지만, **100건을 for문으로 빠르게 `send()`하는 그 짧은 구간** 동안 `batch.size`가 작으면 배치가 일찍 꽉 차 잘게 쪼개져 나가고 `linger=0`이면 즉시 전송된다. batch가 크고 linger가 있으면 같은 100건이 **더 적은 수의 큰 배치**로 묶인다. **flush가 있어도 linger/batch.size는 "한 폴링 사이클 안의 묶음 단위"에 실제로 영향을 준다.**
+
+### 배운 것 (조각5 시점)
+- **배치는 발행 패턴이 먼저, 설정이 그 다음.** 동기 .get()-per-message였다면 버퍼에 한 건뿐이라 어떤 설정도 안 묶인다. 비동기 send→flush로 패턴을 바꾼 뒤에야 `linger`/`batch.size`가 묶음 단위를 키우는 레버로 작동했다
+- **compression은 별도 축.** 묶음 수(`records_per_request`)와 무관하게 전송 바이트만 줄인다(lz4 → 0.61). 묶음↑(네트워크 왕복↓)과 압축(대역폭↓)은 다른 이득
+- **정직한 한계 ①**: 이 producer 효율 개선은 **consumer lag을 줄이지 않는다.** 우리 병목은 consumer 처리(50ms)였고 조각4(concurrency)에서 이미 해소했다. producer 튜닝은 **발행측 효율**(왕복·대역폭) 개선이지 end-to-end 처리량 천장(=consumer)을 올리는 게 아니다 — 메커니즘 체득이 목적
+- **정직한 한계 ②**: 단일 브로커라 `acks=all ≈ acks=1`(ISR=리더 자신뿐). 복제/내구성 트레이드오프는 못 봤다 — 인지만
+
 ### 진행 상태
-조각1~4 완료. **병목 재현(≈4k 우상향) → 파티션만으론 미해소(함정) → concurrency 1:1로 천장 4배(lag 평탄) 까지 관찰.** 다음: **조각5**(producer 튜닝 — `linger.ms`/`batch.size`/`compression`/`acks`의 지연↔처리량↔내구성 트레이드오프). 단, 현재 병목은 consumer 처리였으므로 조각5는 발행측 별개 실험. 단일 브로커라 복제/ISR(내구성)은 못 봄 — 인지만
+조각1~5 완료 = **Step 7 마무리.** **병목 재현(≈4k 우상향) → 파티션만으론 미해소(함정) → concurrency 1:1로 천장 4배(lag 평탄) → producer 배치/압축 튜닝(요청당 묶음 6배·요청 ¼·압축 39%, A/B로 확인)** 까지 관찰. 핵심 루프(파티션 ↔ concurrency ↔ producer 배치)를 코드와 숫자로 다 돌았다. 다음: **Step 8 — 쿠버네티스(로컬 kind/k3d).**
 
 ---
 
