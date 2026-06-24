@@ -851,6 +851,60 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
+## Step 8 — 쿠버네티스 (로컬 kind, 진행중)
+
+### 직전의 고통
+지금까지 전부 `docker-compose`였다. compose는 "한 파일에 서비스 나열 → `up`" 으로 충분했지만, **compose가 암묵적으로 가려주던 것들**(기동 순서, 의존 서비스 존재, 내부 DNS)이 k8s에선 명시적으로 드러난다 — 그 차이를 직접 겪어보기 (kind = 클러스터 노드 자체가 도커 컨테이너)
+
+### 핵심 개념 — 선언형 매니페스트 + 리소스 kind 분리
+- **매니페스트 = "원하는 상태"를 적은 YAML 선언서.** 명령형("띄워라")이 아니라 선언형("이 상태였으면"). `kubectl apply` → k8s가 현재 상태와 비교해 그 상태로 **수렴**시킨다(파드 죽으면 자동 재생성)
+- compose 블록 하나 → k8s는 **리소스 kind별로 쪼개서** 번역한다:
+
+  | k8s kind | compose 대응 | 역할 |
+  |---|---|---|
+  | `Deployment` | 앱 `service` 블록 | 상태 없는 앱. 죽으면 아무 노드서나 새로(고정 이름·디스크 불필요) |
+  | `StatefulSet` | DB·kafka 블록 | 상태 있는 것. 고정 이름(`-0`) + 전용 디스크(PVC) |
+  | `Service`(ClusterIP/headless) | compose 내부 DNS | 파드 앞 고정 주소/DNS, 로드밸런싱 |
+  | `ConfigMap` / `Secret` | `environment:` 평문 / 비번 | 설정값 / 자격증명 분리 |
+  | probe(startup/readiness/liveness) | `healthcheck` | actuator 헬스 → k8s probe로 전환|
+
+### 설계 결정
+- **앱 = Deployment, 상태(DB·kafka) = StatefulSet.** kafka는 "자기 자신을 가리키는 안정적 네트워크 정체성"(advertised 주소 + 컨트롤러 쿼럼 보터)이 필요해 랜덤 이름의 Deployment로는 불가 → 고정 이름 `kafka-0`
+- **이미지 로드 전략이 둘로 갈린다**: product/order/payment는 **로컬 빌드** 이미지라 `kind load`로 노드 캐시에 넣어야 함(레지스트리에 없음). kafka는 **공개 이미지**(`apache/kafka:3.9.0`)라 노드가 Docker Hub에서 직접 pull → load 불필요
+- **조각 순서를 kafka가 앱보다 앞에 오게 보정**(원래 뒤 조각이었음). 앱이 부팅 때 kafka DNS에 의존하기 때문 — 아래 관찰이 그 이유를 증명한다
+- Step7 부하 노브(`PAYMENT_COMMANDS_PARTITIONS`/`OUTBOX_PRODUCER_*`/`PAYMENT_APPROVAL_LIMIT` 등)는 앱 기본값 사용 → ConfigMap에서 생략
+
+### 무엇을 만들었나 
+- **조각0**: kind 클러스터(`cluster.yaml`: control-plane + worker 2) + `commerce` namespace
+- **조각1**: product-db(StatefulSet + PVC 1Gi + Secret + headless Service). PVC `data-product-db-0` Bound
+- **조각2**: product-service(Deployment + ClusterIP Service + ConfigMap + probe 3종). → **CrashLoopBackOff 겪음(TS-10)**, 임시로 컨슈머 OFF
+- **조각 kafka**: kafka(StatefulSet KRaft 단일 노드 + headless Service + PVC). advertised = 파드 안정 DNS `kafka-0.kafka.commerce.svc.cluster.local:9092`. headless에 `publishNotReadyAddresses: true`로 컨트롤러 자기참조 부팅 회피 → **조각2의 컨슈머 부활**
+- **조각3**: order/payment + 각 DB(product 패턴 그대로 재사용, 값만 교체). order만 `PRODUCT_SERVICE_URL`(동기 호출 대상) 추가, payment는 이벤트 구동이라 더 단순
+
+### 막힌 것 → 트러블슈팅
+- **TS-10 — 조각2 product-service `CrashLoopBackOff`.** 원인: `StockCommandListener @KafkaListener`의 컨테이너가 부팅 끝에 start → `kafka:9092` DNS resolve 시도 → **클러스터에 kafka Service가 없어** hard fail(`No resolvable bootstrap urls`) → context 기동 실패. **compose에선 kafka 컨테이너가 늘 있어 숨어 있던 부팅 의존성**이 k8s에서 드러난 것. 임시 해결: ConfigMap `SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"` → 앱은 뜨되 컨슈머만 정지. **근본 해결은 조각 kafka에서 브로커를 세우고 이 줄을 제거**(루프 종료).
+- **TS-11 — `kind load`가 `content digest ... not found`로 실패.** 원인: Docker Desktop의 **containerd 이미지 스토어** + 멀티플랫폼 이미지(kafka) **공개 이미지는 load 자체가 불필요**(노드가 직접 pull)라 우회. 로컬 단일 빌드 이미지(order/payment)는 정상 로드됨
+
+### 직접 관찰한 것
+- **순서의 보상 (조각2 ↔ 조각3 대비, 이 단계의 핵심 체감).** kafka를 먼저 세운 뒤 올린 order/payment는 **`AUTO_STARTUP=false` 없이 한 번에 `1/1 Running`** — 부팅 시 `kafka:9092`가 풀려 컨슈머가 바로 기동(`order: stock-replies/payment-replies`, `payment: payment-commands/payment-refund-commands` partitions assigned). **"의존 대상을 먼저 세우면 뒤따르는 서비스는 같은 고통을 안 겪는다"** 를 CrashLoop 유무로 눈으로 확인.
+- **advertised listener 설계가 실제로 동작(TS-1 재림).** 컨슈머 로그의 `currentLeader=...kafka-0.kafka.commerce.svc.cluster.local:9092` — 클라이언트가 `kafka:9092`(bootstrap)로 붙은 뒤 브로커가 알려준 **파드 안정 DNS**로 재접속. advertised가 틀렸으면 여기서 깨졌을 것.
+- **사가 전체가 클러스터 안에서 동작(port-forward로 주문 투입).**
+  - **보상 경로**: 빈 product-db(시드 없음) → `productId` `PRODUCT_001`(NOT_FOUND) → `StockProcessed(FAILED)` → order 보상 트랜잭션 → `RefundPayment` → payment `REFUNDED` → order **`CANCELLED`**.
+  - **해피 패스**: product 시드(재고 100) 후 주문 → product `재고 차감 DEDUCTED`(100→98) + payment `APPROVED`(paymentId=2) → order **`CONFIRMED`**.
+  - 두 경로 모두 5개 서비스가 참여하고, **traceId가 product·payment 로그에 동일** → 분산 추적 컨텍스트가 Kafka 메시지를 타고 전파됨까지 증명.
+- **DB per service가 물리적으로 드러남.** k8s product-db는 compose product-db와 **다른 PVC(다른 디스크)** 라 시드가 없어 첫 주문이 NOT_FOUND. "각 서비스는 자기 DB만 본다"가 디스크 단위로 보였다.
+
+### 배운 것 (조각0~3 시점)
+- **compose가 가려주던 부팅 의존성이 k8s에선 터진다.** compose의 암묵적 "컨테이너 항상 존재"가 사라지면 서비스 간 부팅 결합이 명시적 실패(CrashLoop)로 드러나고, 그걸 **인프라를 올바른 순서로 세워** 해소한다
+- **앱 = Deployment / 상태 = StatefulSet** 의 갈림은 "안정적 정체성·전용 디스크가 필요한가"로 결정된다. kafka advertised (`publishNotReadyAddresses`)까지 가서 체득
+- **이미지 출처(로컬 빌드 vs 공개)가 배포 절차를 가른다** — load 필요/불필요, 그리고 kind load의 containerd 함정(TS-11)
+- **번역이 반복되며 손에 익는다.** compose 블록 → 매니페스트 여러 kind를 product→order→payment 세 번 반복하니 패턴이 몸에 남았다
+
+### 진행 상태
+조각0~3 + 사가 검증 완료. **kind 위에 7개 파드(kafka-0, order/product/payment-db-0, order/product/payment-service) Running, 사가 정상·보상 양 경로 통과.** 다음: **조각4 — gateway → Ingress**(지금은 서비스마다 port-forward를 따로 뚫어야 하는 불편이 동기), 그 후 **HPA**(부하 따라 자동 스케일).
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:

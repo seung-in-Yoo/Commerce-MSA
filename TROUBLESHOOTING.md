@@ -6,6 +6,7 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-11](#ts-11--kind-load-docker-image가-content-digest--not-found로-실패) | 2026-06-24 | step8 | `kind load docker-image`가 `content digest ... not found`로 실패 — Docker Desktop containerd 이미지 스토어 + 멀티플랫폼 이미지 |
 | [TS-10](#ts-10--k8s에서-product-service-crashloopbackoff--no-resolvable-bootstrap-urls) | 2026-06-24 | step8 | k8s 조각2에서 product-service가 `CrashLoopBackOff` — kafka Service 미배포라 `@KafkaListener` 컨슈머가 부팅 끝에 `kafka:9092` DNS resolve 실패(`No resolvable bootstrap urls`) |
 | [TS-9](#ts-9--커스텀-producerfactory에-native-producer-metric이-안-나온다) | 2026-06-24 | step7 | `actuator/prometheus`에 `kafka_producer_*`가 하나도 없음 — 커스텀 ProducerFactory엔 KafkaClientMetrics가 자동으로 안 붙음 |
 | [TS-8](#ts-8--grafana-datasource-loki-was-not-found--프로비저닝은-부팅-시-한-번만-읽는다) | 2026-06-18 | step6 | 대시보드에 `Datasource loki was not found` — datasource.yml에 Loki 추가했지만 grafana를 재기동 안 해 미반영 |
@@ -16,6 +17,51 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-11 — `kind load docker-image`가 `content digest ... not found`로 실패
+
+- **날짜**: 2026-06-24
+- **단계**: step8 (쿠버네티스 — 조각 kafka 이미지 적재)
+
+### 증상
+
+kafka(`apache/kafka:3.9.0`)를 kind 노드에 적재하려는데 실패했다:
+
+```
+$ kind load docker-image apache/kafka:3.9.0 --name commerce
+Image: "apache/kafka:3.9.0" with ID "sha256:fbc7d..." not yet present on node "commerce-worker2", loading...
+ERROR: failed to load image: command "docker exec ... ctr ... images import ..." failed with error: exit status 1
+Command Output: ctr: content digest sha256:515a27c1...: not found
+```
+
+### 원인 — containerd 이미지 스토어 + 멀티플랫폼 매니페스트
+
+- Docker Desktop의 **containerd 이미지 스토어**가 켜져 있으면(`docker images` 출력에 `DISK USAGE / CONTENT SIZE` 컬럼이 보이는 게 신호) `docker save`가 **멀티플랫폼 매니페스트**를 내보내는데, 현재 머신에 없는 플랫폼의 블롭(digest)까지 참조한다. `kind load`가 내부적으로 쓰는 `ctr images import`가 그 빠진 digest를 찾다 실패한다
+- **로컬 단일 빌드 이미지(`commerce-msa-*`)는 단일 플랫폼이라 같은 경로로도 정상 로드된다** — 실제로 order/payment 이미지는 문제없이 들어갔다. 멀티아치 공개 이미지에서만 터진 것.
+
+### 해결 — 공개 이미지는 애초에 load가 불필요
+
+- kafka는 **Docker Hub 공개 이미지**라 노드가 직접 pull할 수 있다. `kind load`를 건너뛰고 그냥 apply하면 `imagePullPolicy: IfNotPresent`가 노드에 없을 때 Hub에서 pull한다:
+
+```yaml
+# kafka.yaml
+image: apache/kafka:3.9.0
+imagePullPolicy: IfNotPresent   # 노드에 없으면 Hub에서 pull
+```
+
+```
+$ kubectl apply -f k8s/manifests/kafka.yaml
+$ kubectl get pods -n commerce   # kafka-0 가 ContainerCreating → Running
+```
+
+- 인터넷 차단 환경이면 우회책: `docker save apache/kafka:3.9.0 -o /tmp/kafka.tar && kind load image-archive /tmp/kafka.tar --name commerce`, 또는 노드 안에서 `docker exec commerce-worker crictl pull apache/kafka:3.9.0`
+
+### 교훈
+
+- **이미지 출처가 적재 절차를 가른다.** 로컬 빌드 이미지(레지스트리에 없음)는 `kind load`가 필수지만, 공개 이미지는 노드가 pull하면 되니 load가 오히려 불필요 — 그리고 멀티아치 공개 이미지는 containerd 스토어에서 load가 깨질 수 있다
+- **에러 메시지의 진짜 원인은 도구 체인 깊은 곳에 있을 수 있다.** `ctr: content digest not found`는 kind/kafka의 문제가 아니라 Docker Desktop의 이미지 스토어 설정에서 비롯됐다 — 같은 명령이 다른 이미지(단일아치)엔 멀쩡했다는 점이 단서
 
 ---
 
