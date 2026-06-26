@@ -1,0 +1,70 @@
+# product-db = MySQL을 k8s로 옮긴 것 -> compose의 product-db 블록 대체
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-db
+  namespace: commerce
+  labels:
+    app: product-db
+spec:
+  clusterIP: None
+  selector:
+    app: product-db
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: product-db
+  namespace: commerce
+spec:
+  serviceName: product-db   # 위 headless Service 이름과 일치
+  replicas: 1               # 단일 인스턴스
+  selector:
+    matchLabels:
+      app: product-db
+  template:
+    metadata:
+      labels:
+        app: product-db
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - name: mysql
+              containerPort: 3306
+          # compose의 environment → Secret에서 통째로 주입
+          envFrom:
+            - secretRef:
+                name: product-db-secret
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          # compose healthcheck → k8s probe로 전환
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -u root -p$MYSQL_ROOT_PASSWORD"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

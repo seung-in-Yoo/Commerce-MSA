@@ -851,6 +851,117 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 
 ---
 
+## Step 8 — 쿠버네티스 (로컬 kind, 진행중)
+
+### 직전의 고통
+지금까지 전부 `docker-compose`였다. compose는 "한 파일에 서비스 나열 → `up`" 으로 충분했지만, **compose가 암묵적으로 가려주던 것들**(기동 순서, 의존 서비스 존재, 내부 DNS)이 k8s에선 명시적으로 드러난다 — 그 차이를 직접 겪어보기 (kind = 클러스터 노드 자체가 도커 컨테이너)
+
+### 핵심 개념 — 선언형 매니페스트 + 리소스 kind 분리
+- **매니페스트 = "원하는 상태"를 적은 YAML 선언서.** 명령형("띄워라")이 아니라 선언형("이 상태였으면"). `kubectl apply` → k8s가 현재 상태와 비교해 그 상태로 **수렴**시킨다(파드 죽으면 자동 재생성)
+- compose 블록 하나 → k8s는 **리소스 kind별로 쪼개서** 번역한다:
+
+  | k8s kind | compose 대응 | 역할 |
+  |---|---|---|
+  | `Deployment` | 앱 `service` 블록 | 상태 없는 앱. 죽으면 아무 노드서나 새로(고정 이름·디스크 불필요) |
+  | `StatefulSet` | DB·kafka 블록 | 상태 있는 것. 고정 이름(`-0`) + 전용 디스크(PVC) |
+  | `Service`(ClusterIP/headless) | compose 내부 DNS | 파드 앞 고정 주소/DNS, 로드밸런싱 |
+  | `ConfigMap` / `Secret` | `environment:` 평문 / 비번 | 설정값 / 자격증명 분리 |
+  | probe(startup/readiness/liveness) | `healthcheck` | actuator 헬스 → k8s probe로 전환|
+
+### 설계 결정
+- **앱 = Deployment, 상태(DB·kafka) = StatefulSet.** kafka는 "자기 자신을 가리키는 안정적 네트워크 정체성"(advertised 주소 + 컨트롤러 쿼럼 보터)이 필요해 랜덤 이름의 Deployment로는 불가 → 고정 이름 `kafka-0`
+- **이미지 로드 전략이 둘로 갈린다**: product/order/payment는 **로컬 빌드** 이미지라 `kind load`로 노드 캐시에 넣어야 함(레지스트리에 없음). kafka는 **공개 이미지**(`apache/kafka:3.9.0`)라 노드가 Docker Hub에서 직접 pull → load 불필요
+- **조각 순서를 kafka가 앱보다 앞에 오게 보정**(원래 뒤 조각이었음). 앱이 부팅 때 kafka DNS에 의존하기 때문 — 아래 관찰이 그 이유를 증명한다
+- Step7 부하 노브(`PAYMENT_COMMANDS_PARTITIONS`/`OUTBOX_PRODUCER_*`/`PAYMENT_APPROVAL_LIMIT` 등)는 앱 기본값 사용 → ConfigMap에서 생략
+
+### 무엇을 만들었나 
+- **조각0**: kind 클러스터(`cluster.yaml`: control-plane + worker 2) + `commerce` namespace
+- **조각1**: product-db(StatefulSet + PVC 1Gi + Secret + headless Service). PVC `data-product-db-0` Bound
+- **조각2**: product-service(Deployment + ClusterIP Service + ConfigMap + probe 3종). → **CrashLoopBackOff 겪음(TS-10)**, 임시로 컨슈머 OFF
+- **조각 kafka**: kafka(StatefulSet KRaft 단일 노드 + headless Service + PVC). advertised = 파드 안정 DNS `kafka-0.kafka.commerce.svc.cluster.local:9092`. headless에 `publishNotReadyAddresses: true`로 컨트롤러 자기참조 부팅 회피 → **조각2의 컨슈머 부활**
+- **조각3**: order/payment + 각 DB(product 패턴 그대로 재사용, 값만 교체). order만 `PRODUCT_SERVICE_URL`(동기 호출 대상) 추가, payment는 이벤트 구동이라 더 단순
+
+### 막힌 것 → 트러블슈팅
+- **TS-10 — 조각2 product-service `CrashLoopBackOff`.** 원인: `StockCommandListener @KafkaListener`의 컨테이너가 부팅 끝에 start → `kafka:9092` DNS resolve 시도 → **클러스터에 kafka Service가 없어** hard fail(`No resolvable bootstrap urls`) → context 기동 실패. **compose에선 kafka 컨테이너가 늘 있어 숨어 있던 부팅 의존성**이 k8s에서 드러난 것. 임시 해결: ConfigMap `SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"` → 앱은 뜨되 컨슈머만 정지. **근본 해결은 조각 kafka에서 브로커를 세우고 이 줄을 제거**(루프 종료).
+- **TS-11 — `kind load`가 `content digest ... not found`로 실패.** 원인: Docker Desktop의 **containerd 이미지 스토어** + 멀티플랫폼 이미지(kafka) **공개 이미지는 load 자체가 불필요**(노드가 직접 pull)라 우회. 로컬 단일 빌드 이미지(order/payment)는 정상 로드됨
+
+### 직접 관찰한 것
+- **순서의 보상 (조각2 ↔ 조각3 대비, 이 단계의 핵심 체감).** kafka를 먼저 세운 뒤 올린 order/payment는 **`AUTO_STARTUP=false` 없이 한 번에 `1/1 Running`** — 부팅 시 `kafka:9092`가 풀려 컨슈머가 바로 기동(`order: stock-replies/payment-replies`, `payment: payment-commands/payment-refund-commands` partitions assigned). **"의존 대상을 먼저 세우면 뒤따르는 서비스는 같은 고통을 안 겪는다"** 를 CrashLoop 유무로 눈으로 확인.
+- **advertised listener 설계가 실제로 동작(TS-1 재림).** 컨슈머 로그의 `currentLeader=...kafka-0.kafka.commerce.svc.cluster.local:9092` — 클라이언트가 `kafka:9092`(bootstrap)로 붙은 뒤 브로커가 알려준 **파드 안정 DNS**로 재접속. advertised가 틀렸으면 여기서 깨졌을 것.
+- **사가 전체가 클러스터 안에서 동작(port-forward로 주문 투입).**
+  - **보상 경로**: 빈 product-db(시드 없음) → `productId` `PRODUCT_001`(NOT_FOUND) → `StockProcessed(FAILED)` → order 보상 트랜잭션 → `RefundPayment` → payment `REFUNDED` → order **`CANCELLED`**.
+  - **해피 패스**: product 시드(재고 100) 후 주문 → product `재고 차감 DEDUCTED`(100→98) + payment `APPROVED`(paymentId=2) → order **`CONFIRMED`**.
+  - 두 경로 모두 5개 서비스가 참여하고, **traceId가 product·payment 로그에 동일** → 분산 추적 컨텍스트가 Kafka 메시지를 타고 전파됨까지 증명.
+- **DB per service가 물리적으로 드러남.** k8s product-db는 compose product-db와 **다른 PVC(다른 디스크)** 라 시드가 없어 첫 주문이 NOT_FOUND. "각 서비스는 자기 DB만 본다"가 디스크 단위로 보였다.
+
+### 배운 것 
+- **compose가 가려주던 부팅 의존성이 k8s에선 터진다.** compose의 암묵적 "컨테이너 항상 존재"가 사라지면 서비스 간 부팅 결합이 명시적 실패(CrashLoop)로 드러나고, 그걸 **인프라를 올바른 순서로 세워** 해소한다
+- **앱 = Deployment / 상태 = StatefulSet** 의 갈림은 "안정적 정체성·전용 디스크가 필요한가"로 결정된다. kafka advertised (`publishNotReadyAddresses`)까지 가서 체득
+- **이미지 출처(로컬 빌드 vs 공개)가 배포 절차를 가른다** — load 필요/불필요, 그리고 kind load의 containerd 함정(TS-11)
+- **번역이 반복되며 손에 익는다.** compose 블록 → 매니페스트 여러 kind를 product→order→payment 세 번 반복하니 패턴이 몸에 남았다
+
+### gateway → Ingress (Ingress ≠ API Gateway)
+
+**직전의 고통.** 조각3까지는 클러스터 안 서비스를 바깥에서 두드리려면 `kubectl port-forward svc/order-service 8080`을 **서비스마다 따로** 띄워야 했다. compose 로 구성했을땐 `gateway-service` 컨테이너 하나(+ 호스트 포트 매핑)가 모든 API의 단일 입구였는데, 그 "한 입구"가 k8s로 오면서 사라졌다
+
+**핵심 개념 — 두 개의 "게이트웨이"는 다른 레이어다.**:
+
+| | 정체 | 하는 일 | 우리 것 |
+|---|---|---|---|
+| **Ingress** | k8s 네이티브 **엣지(L7)** | "바깥 → 클러스터 안 *어느 Service로*" 만 | `ingress.yaml` (규칙) + `ingress-nginx` (컨트롤러) |
+| **API Gateway** | **앱 레벨** 라우터 | path별 서비스 선택 + **서킷브레이커**(Step5c) + 트레이싱 시작 | `gateway-service` (Spring Cloud Gateway) |
+
+- 또 하나의 분리: **Ingress 오브젝트 ≠ Ingress 컨트롤러.** `ingress.yaml`은 "규칙(데이터)"일 뿐이고, 실제 트래픽은 `ingress-nginx-controller`(nginx Pod)가 그 규칙을 읽어 처리한다. **컨트롤러가 없으면 ingress.yaml은 아무 효과 없음.**
+
+**설계 결정 — A안(Ingress → gateway → 서비스).** Ingress가 path 라우팅까지 직접 하면 gateway를 버릴 수 있지만(B안), 그러면 Step5c에서 만든 **서킷브레이커가 통째로 사라진다.** 그래서 gateway-service를 **그냥 또 하나의 Deployment로** k8s에 올리고(DB 없으니 Secret/datasource 없는 stateless 버전), Ingress는 **전부(`path: /`) gateway로 던지기만** 한다. → Ingress 규칙이 한 줄로 끝나고, "엣지 vs 앱 라우터"의 레이어 분리가 코드로 드러난다
+
+**kind 특유의 준비.** Ingress가 `localhost:80`으로 닿으려면 `cluster.yaml`에 두 가지를 선언 (노드 생성 시점에만 적용 → **클러스터 재생성 필요**):
+- `extraPortMappings` 80/443 — kind 노드는 도커 컨테이너라, 이게 없으면 호스트의 `localhost:80`이 노드 안으로 못 들어간다.
+- `node-labels: ingress-ready=true` (control-plane) — ingress-nginx 컨트롤러가 **이 라벨 붙은 노드에** 떠야 위 포트매핑과 짝이 맞는다.
+
+**무엇을 만들었나.** `gateway-service-config.yaml`(ConfigMap: SERVER_PORT + ORDER/PRODUCT/PAYMENT_SERVICE_URI + ZIPKIN), `gateway-service.yaml`(Deployment + ClusterIP Service, **DB 없어 order 패턴에서 Secret/datasource 제거**), `ingress.yaml`(`path: /` Prefix → `gateway-service:8080`). + `cluster.yaml`에 extraPortMappings·ingress-ready 추가
+
+**막힌 것 → TS-12.** ingress-nginx `main` 매니페스트가 옛 kind 버전에 있던 `nodeSelector: ingress-ready=true`를 빼버려서, 컨트롤러가 라벨 없는 **worker에 스케줄** → control-plane의 포트매핑과 노드가 어긋나 `localhost:80`이 불통(`kubectl wait`가 영영 안 끝남). 컨트롤러 Deployment에 nodeSelector를 patch해 control-plane으로 재스케줄시켜 해결
+
+**직접 관찰한 것.** 컨트롤러를 control-plane(`1/1`)으로 옮긴 뒤, **port-forward 0개로 `localhost:80` 한 입구**에서 사가 양 경로가 다 돌았다:
+- 보상: 재고 0(시드 필드명 `stockQuantity` 실수) → 주문1 `CANCELLED`
+- 해피: 재고 100 시드 → 주문2 `CONFIRMED` + 상품 재고 100→**97**
+- 둘 다 `Ingress → gateway → order → kafka → product/payment` 경로. "서비스마다 port-forward" 고통이 한 입구로 사라졌다
+
+**배운 것 (조각4 시점).**
+- **Ingress와 API Gateway는 경쟁 관계가 아니라 다른 층이다.** 가장 흔한 혼동 — Ingress(엣지: 바깥→안)와 앱 게이트웨이(라우팅+회복탄력성)는 보통 **같이** 쓴다. A안이 그걸 코드로 보여준다
+- **선언적 오브젝트(Ingress)는 그걸 실행하는 컨트롤러가 있어야 의미가 있다.** k8s 곳곳의 패턴(오브젝트=의도 / 컨트롤러=실행)을 Ingress에서 다시 확인
+- **kind에서 "바깥에서 닿기"는 노드=컨테이너라는 사실과 직결**(extraPortMappings + 컨트롤러 배치). 클라우드 LoadBalancer가 공짜로 해주던 걸 손으로 엮어보며 이해
+
+### 조각5 — HPA (HorizontalPodAutoscaler, 부하 따라 자동 스케일)
+
+**직전의 고통.** 지금까지 모든 서비스가 `replicas: 1` 고정이었다. Step7에서 "부하를 주면 버거워진다"(lag 폭증)를 측정했고, 그때 해법은 컨슈머 concurrency를 **사람이 미리 정한 고정값**으로 올리는 것이었다. HPA의 동기는 그 한 단계 위 — **트래픽에 따라 Pod 수 자체를 사람 손 안 대고 자동으로 늘렸다 줄였다** 하는 것. compose로는 불가능한, k8s를 쓰는 핵심 이유
+
+**핵심 개념 — 맞물려야 도는 4개.**
+- **HPA 오브젝트** = "order-service를 CPU 50% 기준 1~5개로 유지해라"는 선언. **HPA 컨트롤러**(컨트롤 플레인 내장)가 주기적으로 CPU를 보고 replica를 조절한다(Ingress와 같은 오브젝트+컨트롤러 패턴). 공식: `원하는 수 = ceil(현재 수 × 현재사용률/목표사용률)`
+- **metrics-server**(별도 애드온) = HPA의 "눈". 각 노드 kubelet에서 Pod CPU/메모리를 긁어 `metrics.k8s.io`로 공급. k8s 기본엔 없어 따로 설치. kind에선 kubelet 인증서가 self-signed라 `--kubelet-insecure-tls` 패치 필요
+- **⚠️ `resources.requests.cpu`** = HPA "%"의 **분모**. CPU 50%는 절대값이 아니라 requests 대비 비율이다. 이게 없으면 HPA가 `<unknown>`을 띄우고 **스케일을 안 한다.** → 대상 Deployment에 requests를 먼저 박는 게 숨은 전제조건
+
+**무엇을 만들었나.** 대상은 **order-service**(주문 POST를 직접 받고 stateless·사가 시작 일꾼). ① `order-service.yaml`에서 고정 `replicas` 제거(HPA가 replica를 "소유" — 안 그러면 apply마다 1로 리셋돼 HPA와 싸움) + `resources` 추가(`requests cpu 200m/mem 512Mi`, `limits cpu 1`; 메모리 limit은 JVM OOMKill 위험으로 생략). ② `order-service-hpa.yaml`(autoscaling/v2, min 1/max 5, CPU 50%, `behavior`로 증설=즉시·감축=300s 안정화 후 1개씩)
+
+**직접 관찰한 것**
+- **배선 확인**: apply 후 HPA TARGETS가 `<unknown>` → `cpu: 20%/50%`(40m/200m)로 바뀜 = requests + metrics-server + HPA 세 개가 물렸다는 증거
+- **스케일업**: k6로 150 RPS(120s)를 `localhost`(ingress)에 꽂자, HPA 이벤트가 **15초 간격으로 `New size: 2 → 4 → 5`**(scaleUp 100%/15s 정책 그대로, max 5 캡). 피크 `216m/200m = 108%`, `ScalingLimited: TooManyReplicas`(더 늘리고 싶지만 상한). 파드가 1→2→4→5로 순차 Ready
+- **과도기의 흔적**: k6 실패율 16.77%인데 p95는 **27ms**. 지연이 아니라 — 부하가 0→150으로 순간에 꽂혀 **오토스케일이 따라잡기 전(~45s) 1개 파드가 다 받다가** gateway 서킷브레이커가 일부를 떨군 것. 5개로 퍼진 뒤 안정. *HPA는 정상, 실패는 "스케일이 따라잡기 전 창"의 자연스러운 결과.*
+- **스케일다운의 보수성**: 부하 종료 후 CPU가 `8%`로 떨어졌는데도 **REPLICAS는 한동안 5 유지** — `scaleDown.stabilizationWindowSeconds: 300`이 "혹시 또 몰릴라" 5분 지켜보는 것. 이게 없으면 부하가 출렁일 때마다 5↔1 요동(flapping). **자원 낭비 ↔ 안정성 트레이드오프**를 눈으로
+
+**배운 것**
+- **HPA는 혼자 못 돈다.** metrics-server(눈) + resources.requests(분모) + HPA(두뇌)가 다 있어야 한다 — 하나만 빠져도 `<unknown>`. "선언 하나 = 동작"이 아니라 **여러 조각의 합**.
+- **스케일 정책은 트레이드오프의 명시화다.** 증설은 빠르게(가용성), 감축은 느리게(안정성) — `behavior`가 그 의사결정을 코드로 박는 자리.
+- **오토스케일은 만능이 아니다.** 순간 스파이크는 스케일이 따라잡기 전 일부 실패가 난다(과도기). 그래서 현실에선 HPA + 서킷브레이커/재시도 + (예측 가능하면) 사전 워밍업을 같이 쓴다.
+
+### 진행 상태 — Step 8 완료 ✅
+조각0~5 전부 완료. **kind 위에서 compose 사가 스택 전체가 동일하게 동작**(Deployment/StatefulSet/Service/ConfigMap/Secret + probe), `localhost:80` 단일 입구(Ingress→gateway), order-service가 부하에 따라 **1↔5 자동 스케일**. Step6~8 확장 트랙(모니터링 → Kafka 성능 → 쿠버네티스)를 최종적으로 마무리
+
+compose가 "암묵적으로 가려주던 것"(기동 순서·서비스 존재·내부 DNS·입구·스케일)을 k8s는 전부 **명시적 선언**으로 바꾼다. 그 명시성이 그게 곧 자동 복구·분산·자동 스케일이라는 **운영 능력**이다. 로컬 kind라 클라우드가 공짜로 해주던 것(LoadBalancer·인증서)을 손으로 엮으며, 나중에 EKS의 한 줄 뒤에서 무슨 일이 일어나는지를 알게 됐다
+
+---
+
 ## 지금까지 관통하는 큰 그림
 
 처음엔 "MSA = 서비스를 잘게 쪼개면 좋아진다"고 생각했지만, 실제로 겪어보니:

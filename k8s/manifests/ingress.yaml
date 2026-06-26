@@ -1,0 +1,20 @@
+# Ingress = 클러스터의 L7 입구
+# 실제 트래픽 처리는 ingress-nginx 컨트롤러
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: commerce-ingress
+  namespace: commerce
+spec:
+  # ingressClassName: 해당 Ingress를 어떤 컨트롤러가 처리할지 -> kind용 ingress-nginx는 nginx 클래스를 만듬
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway-service
+                port:
+                  number: 8080

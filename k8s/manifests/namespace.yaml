@@ -1,0 +1,6 @@
+# 해당 프로젝트 전용 네임스페이스 (폴더)
+# 앞으로 모든 매니페스트는 metadata.namespace: commerce 로 해당 폴더에 들어감
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: commerce

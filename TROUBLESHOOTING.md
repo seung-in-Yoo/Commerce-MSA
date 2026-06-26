@@ -6,6 +6,9 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-12](#ts-12--ingress-nginx-컨트롤러가-worker에-스케줄돼-localhost80-불통) | 2026-06-26 | step8 | Ingress 도입 후 `curl localhost:80` 불통 — ingress-nginx `main` 매니페스트가 `nodeSelector: ingress-ready=true`를 빠뜨려 컨트롤러가 포트매핑 없는 worker에 스케줄 |
+| [TS-11](#ts-11--kind-load-docker-image가-content-digest--not-found로-실패) | 2026-06-24 | step8 | `kind load docker-image`가 `content digest ... not found`로 실패 — Docker Desktop containerd 이미지 스토어 + 멀티플랫폼 이미지 |
+| [TS-10](#ts-10--k8s에서-product-service-crashloopbackoff--no-resolvable-bootstrap-urls) | 2026-06-24 | step8 | k8s 조각2에서 product-service가 `CrashLoopBackOff` — kafka Service 미배포라 `@KafkaListener` 컨슈머가 부팅 끝에 `kafka:9092` DNS resolve 실패(`No resolvable bootstrap urls`) |
 | [TS-9](#ts-9--커스텀-producerfactory에-native-producer-metric이-안-나온다) | 2026-06-24 | step7 | `actuator/prometheus`에 `kafka_producer_*`가 하나도 없음 — 커스텀 ProducerFactory엔 KafkaClientMetrics가 자동으로 안 붙음 |
 | [TS-8](#ts-8--grafana-datasource-loki-was-not-found--프로비저닝은-부팅-시-한-번만-읽는다) | 2026-06-18 | step6 | 대시보드에 `Datasource loki was not found` — datasource.yml에 Loki 추가했지만 grafana를 재기동 안 해 미반영 |
 | [TS-7](#ts-7--outboxstore-and-forward-경계가-분산추적-trace를-끊는다) | 2026-06-18 | step5b | Kafka 추적은 켰는데 사가가 한 trace로 안 묶임 — Outbox 릴레이가 다른 스레드/나중에 발행해 trace 단절 |
@@ -15,6 +18,196 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-12 — ingress-nginx 컨트롤러가 worker에 스케줄돼 `localhost:80` 불통
+
+- **날짜**: 2026-06-26
+- **단계**: step8 (쿠버네티스 — 조각4 gateway → Ingress)
+
+### 증상
+
+조각4에서 Ingress를 도입하고 컨트롤러 Ready를 기다렸는데 `kubectl wait`가 영영 안 끝났다:
+
+```
+$ kubectl wait --namespace ingress-nginx --for=condition=ready pod \
+    --selector=app.kubernetes.io/component=controller --timeout=120s
+# ...아무 진행 없이 멈춤 → Ctrl-C
+
+$ kubectl get pods -n ingress-nginx -o wide
+NAME                                        READY   STATUS              NODE
+ingress-nginx-controller-54754544b9-sh4nl   0/1     ContainerCreating   commerce-worker   ← worker!
+```
+
+`cluster.yaml`에서 `extraPortMappings`(80/443)와 `ingress-ready=true` 라벨은 **control-plane** 노드에 박았는데, 컨트롤러는 **worker**에 떨어졌다. 즉 `localhost:80 → control-plane:80`인데 nginx는 worker에서 LISTEN → 길이 어긋나 바깥에서 닿지 않는다
+
+### 원인 — `main` 매니페스트가 kind용 nodeSelector를 빠뜨림
+
+- kind에서 ingress-nginx를 쓰는 표준 패턴은 컨트롤러를 **`ingress-ready=true` 라벨이 붙은 노드(=control-plane)**에 고정 배치하는 것
+- 그런데 `.../deploy/static/provider/kind/deploy.yaml`을 **`main` 브랜치**에서 받으면, 예전 릴리스엔 있던 `nodeSelector: ingress-ready=true`가 빠져 있어 컨트롤러의 nodeSelector가 `kubernetes.io/os: linux`뿐이다 → 스케줄러가 아무 노드(worker)에나 배치
+
+```
+$ kubectl get nodes -L ingress-ready
+NAME                     ROLES           INGRESS-READY
+commerce-control-plane   control-plane   true        ← 라벨 여기만
+commerce-worker          <none>
+commerce-worker2         <none>
+
+$ kubectl get deploy -n ingress-nginx ingress-nginx-controller \
+    -o jsonpath='{.spec.template.spec.nodeSelector}'
+{"kubernetes.io/os":"linux"}   ← ingress-ready가 없다
+```
+
+> 참고: 처음 보인 `FailedMount ... secret "ingress-nginx-admission" not found`는 **별개의 일시적 현상**이다
+
+### 해결 — 컨트롤러에 nodeSelector를 추가해 control-plane으로 재스케줄
+
+```bash
+kubectl -n ingress-nginx patch deployment ingress-nginx-controller \
+  --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/nodeSelector/ingress-ready","value":"true"}]'
+
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=90s
+```
+
+control-plane용 toleration(`node-role.kubernetes.io/control-plane:NoSchedule`)은 매니페스트에 이미 있어서, 라벨만 맞춰주면 그 노드로 잘 내려간다 → `1/1 Running` on `commerce-control-plane` → `curl localhost:80` 통
+
+- **대안(더 재현성 좋음)**: `main` 대신 `nodeSelector: ingress-ready=true`가 포함된 **릴리스 태그** URL로 설치(예: `.../ingress-nginx/controller-vX.Y.Z/deploy/static/provider/kind/deploy.yaml`). 그러면 patch가 불필요하다
+
+### 교훈
+
+- **kind에서 "바깥에서 닿기"는 노드 배치 문제다.** `extraPortMappings`가 있는 노드와 컨트롤러가 뜨는 노드가 **같아야** 한다
+- **`main`(움직이는 타깃) 매니페스트는 가정이 깨질 수 있다.** 재현 가능한 설치는 **버전 태그를 핀**하거나, 설치 후 의존하는 속성(여기선 nodeSelector)을 **명시적으로 보정**해 둔다
+- **여러 경고가 동시에 뜰 때 범인 구분**: `FailedMount`(일시적, Job 선후) ≠ 스케줄 노드 불일치(진짜 원인). 증상마다 생명주기를 봐야 한다
+
+## TS-11 — `kind load docker-image`가 `content digest ... not found`로 실패
+
+- **날짜**: 2026-06-24
+- **단계**: step8 (쿠버네티스 — 조각 kafka 이미지 적재)
+
+### 증상
+
+kafka(`apache/kafka:3.9.0`)를 kind 노드에 적재하려는데 실패했다:
+
+```
+$ kind load docker-image apache/kafka:3.9.0 --name commerce
+Image: "apache/kafka:3.9.0" with ID "sha256:fbc7d..." not yet present on node "commerce-worker2", loading...
+ERROR: failed to load image: command "docker exec ... ctr ... images import ..." failed with error: exit status 1
+Command Output: ctr: content digest sha256:515a27c1...: not found
+```
+
+### 원인 — containerd 이미지 스토어 + 멀티플랫폼 매니페스트
+
+- Docker Desktop의 **containerd 이미지 스토어**가 켜져 있으면(`docker images` 출력에 `DISK USAGE / CONTENT SIZE` 컬럼이 보이는 게 신호) `docker save`가 **멀티플랫폼 매니페스트**를 내보내는데, 현재 머신에 없는 플랫폼의 블롭(digest)까지 참조한다. `kind load`가 내부적으로 쓰는 `ctr images import`가 그 빠진 digest를 찾다 실패한다
+- **로컬 단일 빌드 이미지(`commerce-msa-*`)는 단일 플랫폼이라 같은 경로로도 정상 로드된다** — 실제로 order/payment 이미지는 문제없이 들어갔다. 멀티아치 공개 이미지에서만 터진 것.
+
+### 해결 — 공개 이미지는 애초에 load가 불필요
+
+- kafka는 **Docker Hub 공개 이미지**라 노드가 직접 pull할 수 있다. `kind load`를 건너뛰고 그냥 apply하면 `imagePullPolicy: IfNotPresent`가 노드에 없을 때 Hub에서 pull한다:
+
+```yaml
+# kafka.yaml
+image: apache/kafka:3.9.0
+imagePullPolicy: IfNotPresent   # 노드에 없으면 Hub에서 pull
+```
+
+```
+$ kubectl apply -f k8s/manifests/kafka.yaml
+$ kubectl get pods -n commerce   # kafka-0 가 ContainerCreating → Running
+```
+
+- 인터넷 차단 환경이면 우회책: `docker save apache/kafka:3.9.0 -o /tmp/kafka.tar && kind load image-archive /tmp/kafka.tar --name commerce`, 또는 노드 안에서 `docker exec commerce-worker crictl pull apache/kafka:3.9.0`
+
+### 교훈
+
+- **이미지 출처가 적재 절차를 가른다.** 로컬 빌드 이미지(레지스트리에 없음)는 `kind load`가 필수지만, 공개 이미지는 노드가 pull하면 되니 load가 오히려 불필요 — 그리고 멀티아치 공개 이미지는 containerd 스토어에서 load가 깨질 수 있다
+- **에러 메시지의 진짜 원인은 도구 체인 깊은 곳에 있을 수 있다.** `ctr: content digest not found`는 kind/kafka의 문제가 아니라 Docker Desktop의 이미지 스토어 설정에서 비롯됐다 — 같은 명령이 다른 이미지(단일아치)엔 멀쩡했다는 점이 단서
+
+---
+
+## TS-10 — k8s에서 product-service `CrashLoopBackOff` (`No resolvable bootstrap urls`)
+
+- **날짜**: 2026-06-24
+- **단계**: step8 (쿠버네티스 — 조각2 product-service Deployment)
+
+### 증상
+
+조각1(product-db StatefulSet)이 `1/1 Running`인 상태에서 조각2로 product-service Deployment를 apply했더니
+파드가 뜨자마자 죽기를 반복했다:
+
+```
+$ kubectl get pods -n commerce
+NAME                               READY   STATUS             RESTARTS        AGE
+product-db-0                       1/1     Running            0               35m
+product-service-68cd499f8b-shmqz   0/1     CrashLoopBackOff   10 (4m11s ago)  31m
+```
+
+`kubectl logs --previous`의 마지막 stack:
+
+```
+Caused by: org.apache.kafka.common.KafkaException: Failed to construct kafka consumer
+  ... ClassicKafkaConsumer.<init> ...
+  ... KafkaMessageListenerContainer.doStart ...
+  ... KafkaListenerEndpointRegistry.start ...
+  ... DefaultLifecycleProcessor.doStart ...
+Caused by: org.apache.kafka.common.config.ConfigException:
+           No resolvable bootstrap urls given in bootstrap.servers
+```
+
+그 위에 비치명 ERROR도 한 줄 찍혀 있었다(아래 참고):
+
+```
+ERROR ... o.springframework.kafka.core.KafkaAdmin : Could not create admin
+Caused by: ... ConfigException: No resolvable bootstrap urls ...
+```
+
+### 원인 — compose가 숨겨준 결합이 k8s에서 터졌다
+
+- product-service의 `StockCommandListener`는 `@KafkaListener(topics = "stock-commands")` 컨슈머다.
+- 스프링 부팅 **마지막 단계**에서 `KafkaListenerEndpointRegistry`(SmartLifecycle)가 이 리스너 컨테이너를 `start` → 컨슈머를 **생성**하면서 `bootstrap.servers = kafka:9092`를 **DNS resolve** 시도한다.
+- 그런데 조각2 시점의 클러스터엔 **`kafka` Service가 아직 없다**(kafka는 뒤 조각에서 배포). DNS 자체가 없어 `No resolvable bootstrap urls` → 컨슈머 생성 실패 → **context refresh 실패** → 프로세스 종료 → `CrashLoopBackOff`.
+- **왜 compose에선 안 터졌나**: docker-compose에선 kafka 컨테이너가 늘 떠 있어 `kafka:9092` DNS가 항상 resolve됐다. "앱이 kafka에 부팅 시점부터 묶여 있다"는 **결합을 compose가 가려줬던** 것 — k8s로 옮겨 의존 Service를 하나씩 세우니 그제서야 드러났다.
+- **흔한 오해 정정**: "readiness 그룹에 kafka가 없으니 브로커가 없어도 앱은 뜨고 컨슈머만 백그라운드 재시도한다"는 *브로커만 죽고 DNS는 되는* 경우에만 참이다. 지금은 **DNS 자체가 불가**라 컨슈머 생성 단계에서 hard fail — 결이 다르다.
+- **앞의 `KafkaAdmin: Could not create admin` ERROR는 범인이 아니다.** `KafkaAdmin`은 `fatalIfBrokerNotAvailable` 기본값이 `false`라, 같은 DNS 실패를 만나도 **로그만 찍고 context를 죽이지 않는다.** 실제 킬러는 그 뒤의 **리스너 컨테이너 start**다(stack의 `KafkaListenerEndpointRegistry.start`로 확인).
+
+### 해결 — 조각2 한정으로 리스너 자동 기동을 끈다
+
+ConfigMap(`product-service-config`)에 한 줄 추가:
+
+```yaml
+data:
+  # ...
+  # 조각2 한정: kafka Service가 아직 없으므로 @KafkaListener를 자동 기동하지 않는다.
+  SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"
+```
+
+`spring.kafka.listener.auto-startup=false`(env relaxed-binding)가 되면 `KafkaListenerEndpointRegistry`가
+리스너 컨테이너를 **start하지 않는다 → 컨슈머를 아예 생성 안 함 → DNS resolve 자체가 없음 → 부팅 성공.**
+(`StockCommandListener`는 커스텀 `containerFactory` 없이 디폴트 팩토리를 쓰므로 이 전역 설정이 그대로 먹는다.)
+
+적용 후:
+
+```
+$ kubectl rollout restart deployment/product-service -n commerce
+$ kubectl get pods -n commerce -l app=product-service
+NAME                               READY   STATUS    RESTARTS   AGE
+product-service-67d7447bb6-z75ds   1/1     Running   0          24s
+
+# Started ProductApplication in 2.112 seconds
+# readiness: {"status":"UP","components":{"db":{"status":"UP"...},"readinessState":{"status":"UP"}}}
+```
+
+`Failed to construct kafka consumer`는 사라졌고, 비치명 `KafkaAdmin: Could not create admin` ERROR 한 줄만 남는다(정상 — 안 죽임).
+
+> **조각2는 "앱1 + DB1"로 유지**하는 게 이 단계의 목적이다. kafka를 배포하는 뒤 조각에서 이 줄을 제거(또는 `"true"`)해 컨슈머를 되살린다.
+
+### 교훈
+
+- **compose는 "전부 한 네트워크에 늘 떠 있음" 덕분에 부팅 시점 의존성을 가려준다.** k8s로 옮겨 Service를 한 조각씩 세우면, 숨어 있던 *부팅 순서/하드 의존*이 그대로 드러난다 — 이게 §13 "동기 결합을 직접 겪는다"의 인프라 버전.
+- **같은 예외 메시지(`No resolvable bootstrap urls`)라도 "로그만 찍는 곳"과 "context를 죽이는 곳"이 다르다.** `KafkaAdmin`(비치명) vs 리스너 컨테이너 start(치명)를 stack으로 구분해야 진짜 범인을 잡는다. ERROR 레벨이라고 다 기동 실패의 원인은 아니다.
+- **부팅 시점 외부 의존을 줄이는 안전장치 = `auto-startup: false`.** 의존 인프라가 아직 없거나 느린 환경에서 리스너를 늦게 켜는 건 흔한 운영 패턴(이후 `KafkaListenerEndpointRegistry`로 런타임에 start 가능).
+- TS-8 교훈("설정 파일 교체 ≠ 프로세스 재적재")과 짝 — ConfigMap을 바꿔도 파드는 자동으로 다시 안 읽으므로 `rollout restart`로 새 파드를 띄워야 반영된다.
 
 ---
 
