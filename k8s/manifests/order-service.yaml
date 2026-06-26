@@ -6,7 +6,7 @@ metadata:
   name: order-service
   namespace: commerce
 spec:
-  replicas: 1
+  # HPA를 위한 고정 replicas 제거
   selector:
     matchLabels:
       app: order-service
@@ -22,6 +22,12 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          resources:
+            requests:
+              cpu: 200m        # 0.2 코어 = HPA %의 분모 (현재 100m 사용 시 = 50%)
+              memory: 512Mi
+            limits:
+              cpu: "1"         # 한 파드 최대 1코어
           envFrom:
             - configMapRef:
                 name: order-service-config
