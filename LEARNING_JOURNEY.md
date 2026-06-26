@@ -933,8 +933,32 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 - **선언적 오브젝트(Ingress)는 그걸 실행하는 컨트롤러가 있어야 의미가 있다.** k8s 곳곳의 패턴(오브젝트=의도 / 컨트롤러=실행)을 Ingress에서 다시 확인
 - **kind에서 "바깥에서 닿기"는 노드=컨테이너라는 사실과 직결**(extraPortMappings + 컨트롤러 배치). 클라우드 LoadBalancer가 공짜로 해주던 걸 손으로 엮어보며 이해
 
-### 진행 상태
-조각0~4 + 사가 검증 완료. **kind 위에 8개 파드(+gateway-service) + ingress-nginx 컨트롤러 Running, `localhost:80` 단일 입구로 사가 정상·보상 양 경로 통과.** 다음(마지막): **HPA** — gateway나 한 서비스에 `HorizontalPodAutoscaler`를 달고 부하(Step7 k6 재활용)를 줘 replica 자동 증감 관찰. 선행: metrics-server 설치.
+### 조각5 — HPA (HorizontalPodAutoscaler, 부하 따라 자동 스케일)
+
+**직전의 고통.** 지금까지 모든 서비스가 `replicas: 1` 고정이었다. Step7에서 "부하를 주면 버거워진다"(lag 폭증)를 측정했고, 그때 해법은 컨슈머 concurrency를 **사람이 미리 정한 고정값**으로 올리는 것이었다. HPA의 동기는 그 한 단계 위 — **트래픽에 따라 Pod 수 자체를 사람 손 안 대고 자동으로 늘렸다 줄였다** 하는 것. compose로는 불가능한, k8s를 쓰는 핵심 이유
+
+**핵심 개념 — 맞물려야 도는 4개.**
+- **HPA 오브젝트** = "order-service를 CPU 50% 기준 1~5개로 유지해라"는 선언. **HPA 컨트롤러**(컨트롤 플레인 내장)가 주기적으로 CPU를 보고 replica를 조절한다(Ingress와 같은 오브젝트+컨트롤러 패턴). 공식: `원하는 수 = ceil(현재 수 × 현재사용률/목표사용률)`
+- **metrics-server**(별도 애드온) = HPA의 "눈". 각 노드 kubelet에서 Pod CPU/메모리를 긁어 `metrics.k8s.io`로 공급. k8s 기본엔 없어 따로 설치. kind에선 kubelet 인증서가 self-signed라 `--kubelet-insecure-tls` 패치 필요
+- **⚠️ `resources.requests.cpu`** = HPA "%"의 **분모**. CPU 50%는 절대값이 아니라 requests 대비 비율이다. 이게 없으면 HPA가 `<unknown>`을 띄우고 **스케일을 안 한다.** → 대상 Deployment에 requests를 먼저 박는 게 숨은 전제조건
+
+**무엇을 만들었나.** 대상은 **order-service**(주문 POST를 직접 받고 stateless·사가 시작 일꾼). ① `order-service.yaml`에서 고정 `replicas` 제거(HPA가 replica를 "소유" — 안 그러면 apply마다 1로 리셋돼 HPA와 싸움) + `resources` 추가(`requests cpu 200m/mem 512Mi`, `limits cpu 1`; 메모리 limit은 JVM OOMKill 위험으로 생략). ② `order-service-hpa.yaml`(autoscaling/v2, min 1/max 5, CPU 50%, `behavior`로 증설=즉시·감축=300s 안정화 후 1개씩)
+
+**직접 관찰한 것**
+- **배선 확인**: apply 후 HPA TARGETS가 `<unknown>` → `cpu: 20%/50%`(40m/200m)로 바뀜 = requests + metrics-server + HPA 세 개가 물렸다는 증거
+- **스케일업**: k6로 150 RPS(120s)를 `localhost`(ingress)에 꽂자, HPA 이벤트가 **15초 간격으로 `New size: 2 → 4 → 5`**(scaleUp 100%/15s 정책 그대로, max 5 캡). 피크 `216m/200m = 108%`, `ScalingLimited: TooManyReplicas`(더 늘리고 싶지만 상한). 파드가 1→2→4→5로 순차 Ready
+- **과도기의 흔적**: k6 실패율 16.77%인데 p95는 **27ms**. 지연이 아니라 — 부하가 0→150으로 순간에 꽂혀 **오토스케일이 따라잡기 전(~45s) 1개 파드가 다 받다가** gateway 서킷브레이커가 일부를 떨군 것. 5개로 퍼진 뒤 안정. *HPA는 정상, 실패는 "스케일이 따라잡기 전 창"의 자연스러운 결과.*
+- **스케일다운의 보수성**: 부하 종료 후 CPU가 `8%`로 떨어졌는데도 **REPLICAS는 한동안 5 유지** — `scaleDown.stabilizationWindowSeconds: 300`이 "혹시 또 몰릴라" 5분 지켜보는 것. 이게 없으면 부하가 출렁일 때마다 5↔1 요동(flapping). **자원 낭비 ↔ 안정성 트레이드오프**를 눈으로
+
+**배운 것**
+- **HPA는 혼자 못 돈다.** metrics-server(눈) + resources.requests(분모) + HPA(두뇌)가 다 있어야 한다 — 하나만 빠져도 `<unknown>`. "선언 하나 = 동작"이 아니라 **여러 조각의 합**.
+- **스케일 정책은 트레이드오프의 명시화다.** 증설은 빠르게(가용성), 감축은 느리게(안정성) — `behavior`가 그 의사결정을 코드로 박는 자리.
+- **오토스케일은 만능이 아니다.** 순간 스파이크는 스케일이 따라잡기 전 일부 실패가 난다(과도기). 그래서 현실에선 HPA + 서킷브레이커/재시도 + (예측 가능하면) 사전 워밍업을 같이 쓴다.
+
+### 진행 상태 — Step 8 완료 ✅
+조각0~5 전부 완료. **kind 위에서 compose 사가 스택 전체가 동일하게 동작**(Deployment/StatefulSet/Service/ConfigMap/Secret + probe), `localhost:80` 단일 입구(Ingress→gateway), order-service가 부하에 따라 **1↔5 자동 스케일**. Step6~8 확장 트랙(모니터링 → Kafka 성능 → 쿠버네티스)를 최종적으로 마무리
+
+compose가 "암묵적으로 가려주던 것"(기동 순서·서비스 존재·내부 DNS·입구·스케일)을 k8s는 전부 **명시적 선언**으로 바꾼다. 그 명시성이 그게 곧 자동 복구·분산·자동 스케일이라는 **운영 능력**이다. 로컬 kind라 클라우드가 공짜로 해주던 것(LoadBalancer·인증서)을 손으로 엮으며, 나중에 EKS의 한 줄 뒤에서 무슨 일이 일어나는지를 알게 됐다
 
 ---
 
