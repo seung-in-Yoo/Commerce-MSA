@@ -6,6 +6,7 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-12](#ts-12--ingress-nginx-컨트롤러가-worker에-스케줄돼-localhost80-불통) | 2026-06-26 | step8 | Ingress 도입 후 `curl localhost:80` 불통 — ingress-nginx `main` 매니페스트가 `nodeSelector: ingress-ready=true`를 빠뜨려 컨트롤러가 포트매핑 없는 worker에 스케줄 |
 | [TS-11](#ts-11--kind-load-docker-image가-content-digest--not-found로-실패) | 2026-06-24 | step8 | `kind load docker-image`가 `content digest ... not found`로 실패 — Docker Desktop containerd 이미지 스토어 + 멀티플랫폼 이미지 |
 | [TS-10](#ts-10--k8s에서-product-service-crashloopbackoff--no-resolvable-bootstrap-urls) | 2026-06-24 | step8 | k8s 조각2에서 product-service가 `CrashLoopBackOff` — kafka Service 미배포라 `@KafkaListener` 컨슈머가 부팅 끝에 `kafka:9092` DNS resolve 실패(`No resolvable bootstrap urls`) |
 | [TS-9](#ts-9--커스텀-producerfactory에-native-producer-metric이-안-나온다) | 2026-06-24 | step7 | `actuator/prometheus`에 `kafka_producer_*`가 하나도 없음 — 커스텀 ProducerFactory엔 KafkaClientMetrics가 자동으로 안 붙음 |
@@ -19,6 +20,66 @@
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
 
 ---
+
+## TS-12 — ingress-nginx 컨트롤러가 worker에 스케줄돼 `localhost:80` 불통
+
+- **날짜**: 2026-06-26
+- **단계**: step8 (쿠버네티스 — 조각4 gateway → Ingress)
+
+### 증상
+
+조각4에서 Ingress를 도입하고 컨트롤러 Ready를 기다렸는데 `kubectl wait`가 영영 안 끝났다:
+
+```
+$ kubectl wait --namespace ingress-nginx --for=condition=ready pod \
+    --selector=app.kubernetes.io/component=controller --timeout=120s
+# ...아무 진행 없이 멈춤 → Ctrl-C
+
+$ kubectl get pods -n ingress-nginx -o wide
+NAME                                        READY   STATUS              NODE
+ingress-nginx-controller-54754544b9-sh4nl   0/1     ContainerCreating   commerce-worker   ← worker!
+```
+
+`cluster.yaml`에서 `extraPortMappings`(80/443)와 `ingress-ready=true` 라벨은 **control-plane** 노드에 박았는데, 컨트롤러는 **worker**에 떨어졌다. 즉 `localhost:80 → control-plane:80`인데 nginx는 worker에서 LISTEN → 길이 어긋나 바깥에서 닿지 않는다
+
+### 원인 — `main` 매니페스트가 kind용 nodeSelector를 빠뜨림
+
+- kind에서 ingress-nginx를 쓰는 표준 패턴은 컨트롤러를 **`ingress-ready=true` 라벨이 붙은 노드(=control-plane)**에 고정 배치하는 것
+- 그런데 `.../deploy/static/provider/kind/deploy.yaml`을 **`main` 브랜치**에서 받으면, 예전 릴리스엔 있던 `nodeSelector: ingress-ready=true`가 빠져 있어 컨트롤러의 nodeSelector가 `kubernetes.io/os: linux`뿐이다 → 스케줄러가 아무 노드(worker)에나 배치
+
+```
+$ kubectl get nodes -L ingress-ready
+NAME                     ROLES           INGRESS-READY
+commerce-control-plane   control-plane   true        ← 라벨 여기만
+commerce-worker          <none>
+commerce-worker2         <none>
+
+$ kubectl get deploy -n ingress-nginx ingress-nginx-controller \
+    -o jsonpath='{.spec.template.spec.nodeSelector}'
+{"kubernetes.io/os":"linux"}   ← ingress-ready가 없다
+```
+
+> 참고: 처음 보인 `FailedMount ... secret "ingress-nginx-admission" not found`는 **별개의 일시적 현상**이다
+
+### 해결 — 컨트롤러에 nodeSelector를 추가해 control-plane으로 재스케줄
+
+```bash
+kubectl -n ingress-nginx patch deployment ingress-nginx-controller \
+  --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/nodeSelector/ingress-ready","value":"true"}]'
+
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=90s
+```
+
+control-plane용 toleration(`node-role.kubernetes.io/control-plane:NoSchedule`)은 매니페스트에 이미 있어서, 라벨만 맞춰주면 그 노드로 잘 내려간다 → `1/1 Running` on `commerce-control-plane` → `curl localhost:80` 통
+
+- **대안(더 재현성 좋음)**: `main` 대신 `nodeSelector: ingress-ready=true`가 포함된 **릴리스 태그** URL로 설치(예: `.../ingress-nginx/controller-vX.Y.Z/deploy/static/provider/kind/deploy.yaml`). 그러면 patch가 불필요하다
+
+### 교훈
+
+- **kind에서 "바깥에서 닿기"는 노드 배치 문제다.** `extraPortMappings`가 있는 노드와 컨트롤러가 뜨는 노드가 **같아야** 한다
+- **`main`(움직이는 타깃) 매니페스트는 가정이 깨질 수 있다.** 재현 가능한 설치는 **버전 태그를 핀**하거나, 설치 후 의존하는 속성(여기선 nodeSelector)을 **명시적으로 보정**해 둔다
+- **여러 경고가 동시에 뜰 때 범인 구분**: `FailedMount`(일시적, Job 선후) ≠ 스케줄 노드 불일치(진짜 원인). 증상마다 생명주기를 봐야 한다
 
 ## TS-11 — `kind load docker-image`가 `content digest ... not found`로 실패
 

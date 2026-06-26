@@ -894,14 +894,47 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
   - 두 경로 모두 5개 서비스가 참여하고, **traceId가 product·payment 로그에 동일** → 분산 추적 컨텍스트가 Kafka 메시지를 타고 전파됨까지 증명.
 - **DB per service가 물리적으로 드러남.** k8s product-db는 compose product-db와 **다른 PVC(다른 디스크)** 라 시드가 없어 첫 주문이 NOT_FOUND. "각 서비스는 자기 DB만 본다"가 디스크 단위로 보였다.
 
-### 배운 것 (조각0~3 시점)
+### 배운 것 
 - **compose가 가려주던 부팅 의존성이 k8s에선 터진다.** compose의 암묵적 "컨테이너 항상 존재"가 사라지면 서비스 간 부팅 결합이 명시적 실패(CrashLoop)로 드러나고, 그걸 **인프라를 올바른 순서로 세워** 해소한다
 - **앱 = Deployment / 상태 = StatefulSet** 의 갈림은 "안정적 정체성·전용 디스크가 필요한가"로 결정된다. kafka advertised (`publishNotReadyAddresses`)까지 가서 체득
 - **이미지 출처(로컬 빌드 vs 공개)가 배포 절차를 가른다** — load 필요/불필요, 그리고 kind load의 containerd 함정(TS-11)
 - **번역이 반복되며 손에 익는다.** compose 블록 → 매니페스트 여러 kind를 product→order→payment 세 번 반복하니 패턴이 몸에 남았다
 
+### gateway → Ingress (Ingress ≠ API Gateway)
+
+**직전의 고통.** 조각3까지는 클러스터 안 서비스를 바깥에서 두드리려면 `kubectl port-forward svc/order-service 8080`을 **서비스마다 따로** 띄워야 했다. compose 로 구성했을땐 `gateway-service` 컨테이너 하나(+ 호스트 포트 매핑)가 모든 API의 단일 입구였는데, 그 "한 입구"가 k8s로 오면서 사라졌다
+
+**핵심 개념 — 두 개의 "게이트웨이"는 다른 레이어다.**:
+
+| | 정체 | 하는 일 | 우리 것 |
+|---|---|---|---|
+| **Ingress** | k8s 네이티브 **엣지(L7)** | "바깥 → 클러스터 안 *어느 Service로*" 만 | `ingress.yaml` (규칙) + `ingress-nginx` (컨트롤러) |
+| **API Gateway** | **앱 레벨** 라우터 | path별 서비스 선택 + **서킷브레이커**(Step5c) + 트레이싱 시작 | `gateway-service` (Spring Cloud Gateway) |
+
+- 또 하나의 분리: **Ingress 오브젝트 ≠ Ingress 컨트롤러.** `ingress.yaml`은 "규칙(데이터)"일 뿐이고, 실제 트래픽은 `ingress-nginx-controller`(nginx Pod)가 그 규칙을 읽어 처리한다. **컨트롤러가 없으면 ingress.yaml은 아무 효과 없음.**
+
+**설계 결정 — A안(Ingress → gateway → 서비스).** Ingress가 path 라우팅까지 직접 하면 gateway를 버릴 수 있지만(B안), 그러면 Step5c에서 만든 **서킷브레이커가 통째로 사라진다.** 그래서 gateway-service를 **그냥 또 하나의 Deployment로** k8s에 올리고(DB 없으니 Secret/datasource 없는 stateless 버전), Ingress는 **전부(`path: /`) gateway로 던지기만** 한다. → Ingress 규칙이 한 줄로 끝나고, "엣지 vs 앱 라우터"의 레이어 분리가 코드로 드러난다
+
+**kind 특유의 준비.** Ingress가 `localhost:80`으로 닿으려면 `cluster.yaml`에 두 가지를 선언 (노드 생성 시점에만 적용 → **클러스터 재생성 필요**):
+- `extraPortMappings` 80/443 — kind 노드는 도커 컨테이너라, 이게 없으면 호스트의 `localhost:80`이 노드 안으로 못 들어간다.
+- `node-labels: ingress-ready=true` (control-plane) — ingress-nginx 컨트롤러가 **이 라벨 붙은 노드에** 떠야 위 포트매핑과 짝이 맞는다.
+
+**무엇을 만들었나.** `gateway-service-config.yaml`(ConfigMap: SERVER_PORT + ORDER/PRODUCT/PAYMENT_SERVICE_URI + ZIPKIN), `gateway-service.yaml`(Deployment + ClusterIP Service, **DB 없어 order 패턴에서 Secret/datasource 제거**), `ingress.yaml`(`path: /` Prefix → `gateway-service:8080`). + `cluster.yaml`에 extraPortMappings·ingress-ready 추가
+
+**막힌 것 → TS-12.** ingress-nginx `main` 매니페스트가 옛 kind 버전에 있던 `nodeSelector: ingress-ready=true`를 빼버려서, 컨트롤러가 라벨 없는 **worker에 스케줄** → control-plane의 포트매핑과 노드가 어긋나 `localhost:80`이 불통(`kubectl wait`가 영영 안 끝남). 컨트롤러 Deployment에 nodeSelector를 patch해 control-plane으로 재스케줄시켜 해결
+
+**직접 관찰한 것.** 컨트롤러를 control-plane(`1/1`)으로 옮긴 뒤, **port-forward 0개로 `localhost:80` 한 입구**에서 사가 양 경로가 다 돌았다:
+- 보상: 재고 0(시드 필드명 `stockQuantity` 실수) → 주문1 `CANCELLED`
+- 해피: 재고 100 시드 → 주문2 `CONFIRMED` + 상품 재고 100→**97**
+- 둘 다 `Ingress → gateway → order → kafka → product/payment` 경로. "서비스마다 port-forward" 고통이 한 입구로 사라졌다
+
+**배운 것 (조각4 시점).**
+- **Ingress와 API Gateway는 경쟁 관계가 아니라 다른 층이다.** 가장 흔한 혼동 — Ingress(엣지: 바깥→안)와 앱 게이트웨이(라우팅+회복탄력성)는 보통 **같이** 쓴다. A안이 그걸 코드로 보여준다
+- **선언적 오브젝트(Ingress)는 그걸 실행하는 컨트롤러가 있어야 의미가 있다.** k8s 곳곳의 패턴(오브젝트=의도 / 컨트롤러=실행)을 Ingress에서 다시 확인
+- **kind에서 "바깥에서 닿기"는 노드=컨테이너라는 사실과 직결**(extraPortMappings + 컨트롤러 배치). 클라우드 LoadBalancer가 공짜로 해주던 걸 손으로 엮어보며 이해
+
 ### 진행 상태
-조각0~3 + 사가 검증 완료. **kind 위에 7개 파드(kafka-0, order/product/payment-db-0, order/product/payment-service) Running, 사가 정상·보상 양 경로 통과.** 다음: **조각4 — gateway → Ingress**(지금은 서비스마다 port-forward를 따로 뚫어야 하는 불편이 동기), 그 후 **HPA**(부하 따라 자동 스케일).
+조각0~4 + 사가 검증 완료. **kind 위에 8개 파드(+gateway-service) + ingress-nginx 컨트롤러 Running, `localhost:80` 단일 입구로 사가 정상·보상 양 경로 통과.** 다음(마지막): **HPA** — gateway나 한 서비스에 `HorizontalPodAutoscaler`를 달고 부하(Step7 k6 재활용)를 줘 replica 자동 증감 관찰. 선행: metrics-server 설치.
 
 ---
 
