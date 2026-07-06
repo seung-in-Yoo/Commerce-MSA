@@ -102,7 +102,7 @@
    ┌────────────┐   ┌────────────┐      ┌────────────┐      ┌────────────┐
    │   order    │   │  product   │      │  payment   │      │   kafka    │
    │  :8080     │   │  :8081     │      │  :8082     │      │  (KRaft)   │
-   │ Saga 오케  │   │  재고      │      │  결제      │      │  command/  │
+   │ Saga 오케   │   │  재고       │      │  결제       │      │  command/  │
    │ +Outbox    │   │            │      │  +Inbox    │      │  reply bus │
    └─────┬──────┘   └─────┬──────┘      └─────┬──────┘      └──────┬─────┘
          │ order-db       │ product-db        │ payment-db         │
