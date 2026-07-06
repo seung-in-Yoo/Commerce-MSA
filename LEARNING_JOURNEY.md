@@ -955,10 +955,56 @@ gateway POST → order POST → outbox-relay.publish → payment-commands send �
 - **스케일 정책은 트레이드오프의 명시화다.** 증설은 빠르게(가용성), 감축은 느리게(안정성) — `behavior`가 그 의사결정을 코드로 박는 자리.
 - **오토스케일은 만능이 아니다.** 순간 스파이크는 스케일이 따라잡기 전 일부 실패가 난다(과도기). 그래서 현실에선 HPA + 서킷브레이커/재시도 + (예측 가능하면) 사전 워밍업을 같이 쓴다.
 
-### 진행 상태 — Step 8 완료 ✅
+### 진행 상태 — Step 8 완료 
 조각0~5 전부 완료. **kind 위에서 compose 사가 스택 전체가 동일하게 동작**(Deployment/StatefulSet/Service/ConfigMap/Secret + probe), `localhost:80` 단일 입구(Ingress→gateway), order-service가 부하에 따라 **1↔5 자동 스케일**. Step6~8 확장 트랙(모니터링 → Kafka 성능 → 쿠버네티스)를 최종적으로 마무리
 
 compose가 "암묵적으로 가려주던 것"(기동 순서·서비스 존재·내부 DNS·입구·스케일)을 k8s는 전부 **명시적 선언**으로 바꾼다. 그 명시성이 그게 곧 자동 복구·분산·자동 스케일이라는 **운영 능력**이다. 로컬 kind라 클라우드가 공짜로 해주던 것(LoadBalancer·인증서)을 손으로 엮으며, 나중에 EKS의 한 줄 뒤에서 무슨 일이 일어나는지를 알게 됐다
+
+---
+
+## Testcontainers — 통합테스트로 "직접 관찰"을 자동화 
+
+### 직전의 고통
+
+프로젝트의 왕관 보석 — Orchestration Saga + Outbox + Inbox 멱등 소비 — 이 **전부 Mockito 단위/`@WebMvcTest` 슬라이스로만** 검증돼 있었다(Kafka·DB 다 가짜). Step4~8 내내 사가가 진짜 도는지는 `port-forward + curl` **수동 관찰**로만 확인했다. 매번 손으로. → 그 "직접 관찰"을 **진짜 MySQL·Kafka를 띄우는 반복 가능한 자동 검증**으로 박제한다.
+
+### 핵심 개념 — Testcontainers ≠ 쿠버네티스
+
+- **Testcontainers**: 테스트가 실행되는 동안만 진짜 인프라(MySQL·Kafka)를 **Docker로 잠깐 띄웠다가 끝나면 자동 제거**하는 라이브러리. 테스트 코드 안 `new MySQLContainer<>(...)` 한 줄이 실제 컨테이너를 띄운다. (Step8의 k8s는 *배포 런타임* — 이건 *테스트*가 진짜 인프라 위에서 도는가의 문제라 서로 무관.)
+- **왜 진짜여야 하나**: mock엔 경쟁·행 잠금·직렬화·비동기 배달이 없다. "동시성 안전"·"이벤트가 실제로 흐름"은 **진짜 인프라 위에서만** 증명된다. H2로도 안 된다(락 동작이 InnoDB와 다름 → 거짓 안심).
+- **새 도구 3종**: `@DynamicPropertySource`(컨테이너의 랜덤 포트를 `spring.*` 설정에 주입) · **Awaitility**(비동기 결과를 "될 때까지 poll") · `CountDownLatch`(스레드를 출발선에 세웠다 동시 발사).
+
+### 설계 결정
+
+- 서비스별 독립 모듈이라 통합테스트도 **서비스별**. 난이도 순 3조각: MySQL만 → Kafka 합류 → 둘 다.
+- 브로커는 프로덕션 이미지(apache/kafka)가 아니라 **안정적으로 뜨는** `ConfluentKafkaContainer` 채택(TS-14).
+- Docker API 버전은 각 build.gradle의 test 태스크에 `api.version=1.44`로 핀(TS-13).
+
+### 무엇을 만들었나 
+
+- **조각1 — product 재고 차감 원자성 (real MySQL)**: 재고 50에 **100 스레드 동시 차감** → 원자적 `UPDATE ... WHERE stockQuantity >= :qty`가 오버셀을 막는지. `CountDownLatch`로 100개를 출발선에 세웠다 동시 발사, 각 호출은 독립 트랜잭션(`TransactionTemplate`). Kafka 리스너는 `auto-startup=false`로 꺼 둠(브로커 없이 부팅).
+- **조각2 — payment 결제 명령 처리 (real Kafka + MySQL)**: `payment-commands` 발행 → 앱이 소비 → `payment-replies` 발행을 끝-끝. 테스트가 앱 `KafkaTemplate`로 명령을 넣고, raw `KafkaConsumer`로 응답을 **Awaitility로 기다려** 검증. APPROVED/FAILED 두 경로.
+- **조각3 (왕관 보석) — order 사가 오케스트레이션 (real Kafka + MySQL)**: order만 띄우고 **테스트가 payment·product를 연기**. `createOrder` → Outbox 릴레이가 명령을 실제 발행(PENDING→SENT) → 테스트가 reply를 주입 → 오케스트레이터가 상태전이·다음 명령 발행. 해피패스(CONFIRMED)/결제거절(CANCELLED)/재고실패 보상(환불+CANCELLED) 3경로.
+
+### 직접 관찰한 것
+
+- **오버셀은 없다 (조각1)**: 100 요청 중 정확히 50 성공/50 실패, 최종 재고 0. mock으론 절대 못 낼 결과 — InnoDB가 같은 로우 UPDATE를 행 단위로 직렬화하는 걸 진짜로 확인.
+- **비동기는 "즉시"가 아니다 (조각2)**: `assertThat`을 바로 못 쓰고 `await().atMost(20s).until(...)`로 응답 도착을 기다려야 했다. 그 대기 자체가 이벤트 기반의 본질을 코드로 드러낸다.
+- **Outbox는 Kafka + DB 양쪽에서 증명 (조각3)**: 명령이 Kafka에 도착했나(발행됨) + outbox 행이 `SENT`로 바뀌었나(마킹됨). `@Scheduled` 릴레이가 테스트 안에서도 1초마다 돌며 store-and-forward를 완주.
+- **"이웃 서비스 연기"로 오케스트레이터만 격리 (조각3)**: 진짜 payment/product 없이, 그 토픽의 producer/consumer가 돼서 order의 사가 전 경로(정상·보상)를 자동으로 돌렸다.
+
+### 막힌 것 → 트러블슈팅
+
+- **[TS-13]** `Could not find a valid Docker environment` — 실은 Docker 29(Min API 1.44) > docker-java 기본 API 버전이라 데몬이 HTTP 400. `api.version=1.44` 시스템 프로퍼티로 핀
+- **[TS-14]** apache/kafka `KafkaContainer`가 `advertised.listeners=0.0.0.0`로 기동 실패(TS-1의 데자뷰). `ConfluentKafkaContainer`로 교체
+
+### 배운 것
+
+- **정교한 패턴 검증은 통합테스트로** 정교한 패턴일수록(Saga/Outbox) mock 검증은 "구조는 맞는데 진짜 도는지는 모른다"에 그친다. 진짜 인프라 위 통합테스트라야 "돈다"를 *볼* 수 있다
+- **통합테스트 3대 도구 세트**: 컨테이너(진짜 인프라) + `@DynamicPropertySource`(랜덤 포트 주입) + Awaitility(비동기 대기)
+- **테스트가 이웃 서비스를 연기**하는 패턴은 마이크로서비스 통합테스트의 핵심 — 전체 스택을 안 띄우고 한 서비스의 협력 계약만 격리 검증
+- **한 번 배운 원리는 도구가 바뀌어도 통한다** — `advertised.listeners` 규칙(TS-1)이 Testcontainers Kafka(TS-14)에서 그대로 재림, k8s에서 겪은 "리스너 컨테이너 start가 부팅을 막는다"(TS-10)가 조각1의 `auto-startup=false`로 재활용
+- **수동 관찰 → 자동 검증으로의 승격.** Step4~8에서 손으로 확인하던 걸 이제 CI(이미 있는 GitHub Actions)가 매번 대신 확인한다 = 회귀 방지망
 
 ---
 
@@ -972,9 +1018,3 @@ compose가 "암묵적으로 가려주던 것"(기동 순서·서비스 존재·�
 4. **관찰 가능성(observability)이 학습의 핵심 도구** probe, healthcheck, 로그(`[order] 발행 → [product] 수신`), consumer offset/lag — 이게 없었으면 "비동기가 됐다"를 *믿을* 수만 있고 *볼* 수는 없었다. Step 6에서 이걸 메트릭·로그·트레이스 삼각형으로 제대로 깔았다.
 
 ---
-
-## 다음 — Step 7 잔여 + Step 8 예고
-
-**Step 7 잔여(조각3~5):** 파티션↑로 병렬 차선을 늘리고(단 컨슈머 스레드 1이면 효과 없음을 관찰) → `@KafkaListener(concurrency)`로 처리 천장 돌파 → producer 튜닝(`linger.ms`/`batch.size`/`compression`/`acks`)의 트레이드오프(지연↔처리량↔내구성). 한계: 단일 브로커라 복제/ISR(내구성)은 못 본다 — 인지만.
-
-**Step 8 예고(쿠버네티스):** 로컬 kind/k3d로 compose → Deployment/Service/ConfigMap/Secret, MySQL·Kafka는 StatefulSet+PVC, **actuator probe → k8s probe(§4 복선 회수)**, 게이트웨이 → Ingress, HPA.
