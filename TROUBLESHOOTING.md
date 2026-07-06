@@ -6,6 +6,8 @@
 
 | ID | 날짜 | 단계 | 한 줄 요약                                                                        |
 |---|---|---|-------------------------------------------------------------------------------|
+| [TS-14](#ts-14--testcontainers-kafka-컨테이너-기동-실패-advertisedlisteners에-0000) | 2026-07-06 | testcontainers | Testcontainers Kafka 컨테이너 기동 실패 — apache/kafka `KafkaContainer`가 `advertised.listeners`를 `0.0.0.0`으로 세팅해 KRaft 포맷 거부, `ConfluentKafkaContainer`로 교체 |
+| [TS-13](#ts-13--testcontainers가-docker-환경을-못-찾음-docker-29-min-api-144) | 2026-07-06 | testcontainers | `Could not find a valid Docker environment` — Docker 29 Min API(1.44) > docker-java 기본 API 버전이라 `/info`가 HTTP 400, `api.version=1.44` 핀 |
 | [TS-12](#ts-12--ingress-nginx-컨트롤러가-worker에-스케줄돼-localhost80-불통) | 2026-06-26 | step8 | Ingress 도입 후 `curl localhost:80` 불통 — ingress-nginx `main` 매니페스트가 `nodeSelector: ingress-ready=true`를 빠뜨려 컨트롤러가 포트매핑 없는 worker에 스케줄 |
 | [TS-11](#ts-11--kind-load-docker-image가-content-digest--not-found로-실패) | 2026-06-24 | step8 | `kind load docker-image`가 `content digest ... not found`로 실패 — Docker Desktop containerd 이미지 스토어 + 멀티플랫폼 이미지 |
 | [TS-10](#ts-10--k8s에서-product-service-crashloopbackoff--no-resolvable-bootstrap-urls) | 2026-06-24 | step8 | k8s 조각2에서 product-service가 `CrashLoopBackOff` — kafka Service 미배포라 `@KafkaListener` 컨슈머가 부팅 끝에 `kafka:9092` DNS resolve 실패(`No resolvable bootstrap urls`) |
@@ -18,6 +20,115 @@
 | [TS-3](#ts-3--새-결제-서비스가-과거-이벤트를-재생해-유령-결제-생성) | 2026-06-15 | step4b | 새 payment가 `earliest`로 과거 이벤트 재생 → 유령 결제(amount=0) + 중복 소비                    |
 | [TS-2](#ts-2--주문-생성-시-column-product_name-cannot-be-null-http-500) | 2026-06-12 | step3b | 주문 생성 시 `Column 'product_name' cannot be null` (HTTP 500)                     |
 | [TS-1](#ts-1--kafka-브로커-기동-실패-kafka_listeners에-0000) | 2026-06-11 | step3a | Kafka 브로커 기동 실패 (`KAFKA_LISTENERS`에 `0.0.0.0`)                                |
+
+---
+
+## TS-14 — Testcontainers Kafka 컨테이너 기동 실패 (advertised.listeners에 0.0.0.0)
+
+- **날짜**: 2026-07-06
+- **단계**: 확장트랙 — Testcontainers 통합테스트 
+
+### 증상
+
+조각2에서 진짜 Kafka를 띄우려 `org.testcontainers.kafka.KafkaContainer("apache/kafka:3.9.0")`를 썼더니, 컨테이너가 기동 로그 대기에서 타임아웃 나고 **exit code 1**로 죽었다:
+
+```
+Caused by: ContainerLaunchException: Timed out waiting for log output matching
+  '.*Transitioning from RECOVERY to RUNNING.*'
+
+# Log output from the failed container:
+Exception in thread "main" java.lang.IllegalArgumentException: requirement failed:
+  advertised.listeners cannot use the nonroutable meta-address 0.0.0.0. Use a routable IP address.
+    at kafka.server.KafkaConfig.validateValues(...)
+    at kafka.tools.StorageTool$...        ← KRaft 포맷(StorageTool) 단계에서 죽음
+```
+
+### 원인 — apache/kafka 이미지 초기화와 Testcontainers 구성의 궁합
+
+apache/kafka(KRaft) 이미지는 컨테이너 시작 시 `StorageTool`로 스토리지를 포맷하는데, 이 단계에 넘어온 `advertised.listeners`에 `0.0.0.0`이 들어 있어 검증에서 거부당했다. Testcontainers 1.21.3의 `org.testcontainers.kafka.KafkaContainer`(apache/kafka용)와 이 이미지 버전의 알려진 궁합 문제.
+
+> **TS-1의 데자뷰.** "advertised에는 라우팅 가능한 주소만, `0.0.0.0` 절대 ❌"라는 규칙이 그대로 재림했다. 다만 이번엔 우리가 아니라 Testcontainers의 컨테이너가 그렇게 세팅한 것.
+
+### 해결 — 검증된 `ConfluentKafkaContainer`로 교체
+
+```java
+// 실패: apache/kafka용 KafkaContainer
+static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:3.9.0");
+
+// 성공: Confluent cp-kafka (둘 다 KRaft, 주키퍼 없음)
+static final ConfluentKafkaContainer KAFKA =
+        new ConfluentKafkaContainer("confluentinc/cp-kafka:7.8.0");
+```
+
+Confluent 계열 컨테이너는 매핑된 포트에 맞춰 `advertised.listeners`를 안정적으로 구성한다.
+
+### 교훈
+
+- **통합테스트의 브로커는 프로덕션 이미지(apache/kafka)와 똑같을 필요가 없다.** 중요한 건 "안정적으로 뜨는 것" — 이미지 매칭은 부차적.
+- 컨테이너가 죽으면 Testcontainers의 **"Log output from the failed container"** 블록을 봐라. 진짜 원인(여기선 KRaft `StorageTool`의 검증 실패)은 거기 찍힌다.
+- 한 번 이해한 원리(`advertised.listeners` = 라우팅 가능 주소, TS-1)는 도구가 바뀌어도 통한다.
+
+---
+
+## TS-13 — Testcontainers가 Docker 환경을 못 찾음 (Docker 29 Min API 1.44)
+
+- **날짜**: 2026-07-06
+- **단계**: 확장트랙 — Testcontainers 통합테스트 
+
+### 증상
+
+첫 통합테스트(`ProductStockConcurrencyIntegrationTest`)를 돌리자 컨테이너가 뜨기도 전에 실패:
+
+```
+java.lang.IllegalStateException: Could not find a valid Docker environment. Please see logs and check configuration
+  EnvironmentAndSystemPropertyClientProviderStrategy: failed with exception BadRequestException (Status 400: {...})
+  UnixSocketClientProviderStrategy:                   failed with exception BadRequestException (Status 400: {...})
+  DockerDesktopClientProviderStrategy:                failed with exception BadRequestException (Status 400: {...})
+```
+
+그런데 `docker info` / `docker ps`는 멀쩡하다. Docker는 살아있는데 Testcontainers만 못 붙는다.
+
+### 원인 — docker-java가 보내는 API 버전이 데몬의 Min API보다 낮다
+
+"Docker가 없다"는 메시지에 속기 쉽지만, **소켓 연결은 됐고 데몬이 HTTP 400을 돌려준 것** — 요청 자체를 거부한 거다. `curl`로 버전별 확인:
+
+```bash
+$ for v in 1.24 1.41 1.43 1.44; do
+    curl -s --unix-socket /var/run/docker.sock http://localhost/v$v/info -o /dev/null -w "v$v -> %{http_code}\n"
+  done
+v1.24 -> 400
+v1.41 -> 400
+v1.43 -> 400
+v1.44 -> 200          # 1.44부터 통과
+
+$ docker version --format 'Min API: {{.Server.MinAPIVersion}}'
+Min API: 1.44
+```
+
+Docker 29.2.1은 오래된 API를 잘라내 **Min API가 1.44**. Testcontainers가 쓰는 docker-java 3.4.2는 기본으로 그보다 낮은 버전을 URL(`/v1.4x/info`)에 박아 보내 → 데몬이 400.
+
+**함정**: `DOCKER_API_VERSION` 환경변수로 고치려 했으나 안 먹었다. 셰이딩된 `DefaultDockerClientConfig`를 열어보니(`javap`), env로는 `DOCKER_HOST` 등만 읽고 API 버전은 **시스템 프로퍼티 `api.version`**으로만 읽는다.
+
+### 해결 — test 태스크에 `api.version` 시스템 프로퍼티 핀
+
+```gradle
+tasks.named('test') {
+    useJUnitPlatform()
+    // docker-java 는 API 버전을 시스템 프로퍼티 api.version 으로 읽는다(env DOCKER_API_VERSION ❌)
+    systemProperty 'api.version', '1.44'
+}
+```
+
+- **왜 build.gradle에 박나**: 인라인 `DOCKER_API_VERSION=1.44 ./gradlew`는 Gradle **데몬**엔 안 전달된다(데몬은 자기가 기동될 때의 환경을 씀). 태스크에 박아야 포크된 테스트 JVM에 확실히 닿고, 커밋되니 CI에서도 동일하게 먹는다.
+- 1.44는 Docker 25.0(2024) 이상이면 모두 지원 → 로컬/CI 양쪽 안전.
+- 세 서비스(product/payment/order) build.gradle에 동일하게 적용.
+
+### 교훈
+
+- **"Could not find a valid Docker environment"는 환경 부재만이 아니라 API 거부(400)도 포함**한다 — 메시지 말고 실제 HTTP 상태를 봐라.
+- 라이브러리(Testcontainers/docker-java) ↔ 데몬은 **버전 스큐**가 생긴다. 최신 Docker일수록 오래된 API를 자른다.
+- 설정 키의 **레이어**를 확인하라: env vs 시스템 프로퍼티 vs 파일. 안 먹으면 라이브러리 소스(또는 `javap`)로 실제 읽는 키를 확인.
+- **Gradle 데몬은 클라이언트 env를 자동 상속하지 않는다** → 테스트용 환경/프로퍼티는 build 스크립트에 명시해야 재현·CI가 보장된다.
 
 ---
 
